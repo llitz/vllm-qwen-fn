@@ -1,0 +1,31 @@
+FROM docker.io/localinferencelab/vllm:jovian-judgement-community-20260914-r38
+
+COPY files/vllm-fn/patches/ /tmp/vllm-fn-patches/
+
+# Pinned pristine r38 (vllm 66c29357) bases: build fails if the base moves
+# under the patches instead of silently stomping upstream changes.
+RUN set -eux; \
+    cd /opt/glm53-flash/vllm; \
+    printf '%s\n' \
+      '1b05037e200c3fca714ce8d300e61b65a78366b92937de329bc68596305f6339  vllm/entrypoints/openai/completion/protocol.py' \
+      '47e5d710fd66886bc25946414f5c8e6e3a665cee7910feb5eacd4a17f3331da7  vllm/entrypoints/openai/chat_completion/protocol.py' \
+      'ec6b8f19ac6c4902e51b0dc9ff5d3cbae2941a3f23f1f2197e5a179295b226a6  vllm/config/speculative.py' \
+      '8ded195623d04ce8b09a897f3551b4045c5b23820a89696f303a9a07d4d2e1e7  vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py' \
+      'e7c04346160dc4cdd885877b6229e9fee37addd7ae4dfbeed7416e594987ba73  vllm/v1/simple_kv_offload/manager.py' \
+      'e66c2770822776c439c364d3aed556f638f0594f02463f1112a36a52074b09cf  vllm/models/qwen3_8_flash_next/config.py' \
+      '0af4afe84067ec09c9907523e6ea2367b4f664f935cc5f35f0a054f04f862e2a  vllm/v1/core/sched/scheduler.py' \
+      | sha256sum -c -; \
+    for pair in \
+      '001-clamp_max_tokens/completion_protocol.py vllm/entrypoints/openai/completion/protocol.py' \
+      '001-clamp_max_tokens/chat_protocol.py vllm/entrypoints/openai/chat_completion/protocol.py' \
+      '002-draft-cumem-allocator/speculative.py vllm/config/speculative.py' \
+      '003-stale-kv-alloc/scheduler.py vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py' \
+      '004-qsa-ring-offload-skip/manager.py vllm/v1/simple_kv_offload/manager.py' \
+      '005-qwen-rope-config-validation/config.py vllm/models/qwen3_8_flash_next/config.py' \
+      '008-spec-invalid-tail-metrics/scheduler.py vllm/v1/core/sched/scheduler.py'; \
+    do \
+      set -- $pair; \
+      cp "/tmp/vllm-fn-patches/$1" "$2"; \
+      rm -f "$(dirname "$2")/__pycache__/$(basename "$2" .py).cpython-*.pyc"; \
+    done; \
+    rm -rf /tmp/vllm-fn-patches

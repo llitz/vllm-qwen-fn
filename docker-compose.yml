@@ -1,0 +1,166 @@
+services:
+  vllm-fn:
+    build:
+      context: .
+      dockerfile: Dockerfile.vllm-fn
+      network: host
+    image: localinferencelab/vllm:jovian-judgement-r38
+    container_name: vllm-fn
+    security_opt:
+      - seccomp=unconfined
+    init: true
+    network_mode: host
+    shm_size: 36g
+    environment:
+      - LLAMAKEY
+      - MODEL=local-inference-lab/Qwen3.8-Flash-Next-NVFP4
+      - PORT=8080
+      - VLLM_NO_USAGE_STATS=1
+      - DO_NOT_TRACK=1
+      - TP=1
+      - HF_HUB_CACHE=/models
+      - HF_HUB_OFFLINE=1
+      - TRANSFORMERS_OFFLINE=1
+      - CUDA_DEVICE_ORDER=PCI_BUS_ID
+      - OMP_NUM_THREADS=2
+      - VLLM_USE_SIMPLE_KV_OFFLOAD=1
+      - VLLM_WORKER_MULTIPROC_METHOD=spawn
+      - VLLM_USE_V2_MODEL_RUNNER=1
+      - VLLM_COMPUTE_NANS_IN_LOGITS=0
+      - VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0
+      - VLLM_SSM_CONV_STATE_LAYOUT=DS
+      - VLLM_PLE_TABLE_MEMORY=ram
+      # Fix A: PLE nvfp4 scale plane in pinned host RAM; reader skips scale fragments.
+      - B12X_PLE_RESIDENT_SCALES=0
+      # Fix B: hosted prefill prefetch gate; 0 = stock sync path (rollout step 3).
+      - VLLM_PLE_DISK_PREFETCH=0
+      - VLLM_DISABLED_KERNELS=MarlinFP8ScaledMMLinearKernel
+      - VLLM_CAUSAL_CONV1D_UPDATE_HOIST=1
+      - VLLM_ENABLE_PCIE_ALLREDUCE=1
+      - VLLM_PCIE_ALLREDUCE_BACKEND=b12x
+      # Target vocab head stays BF16; only the private MTP draft head is NVFP4.
+      - VLLM_MXFP8_LM_HEAD=0
+      - VLLM_MTP_NVFP4_LM_HEAD=1
+      # Keep draft-head activations BF16 (W4A16). 0 gave ~zero MTP acceptance.
+      - VLLM_LM_HEAD_A16=1
+      - VLLM_QWEN3_8_FLASH_NEXT_MTP_COMPACT=1
+      - VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH=1
+      - VLLM_QWEN3_8_FLASH_NEXT_OVERLAP=1
+      - VLLM_B12X_DENSE_ACTIVATION_MODE=auto
+      - B12X_DYNAMIC_SPLIT_ROUTE_COMPUTE=1
+      - B12X_DYNAMIC_DIRECT_EXPERT_SCALES=1
+      - B12X_DYNAMIC_SPLIT_LOW_SMEM=1
+      - B12X_DYNAMIC_SKIP_SPLIT_BARRIER_RESET=1
+      - B12X_DYNAMIC_SPLIT_FAST_PREPARE=1
+      - B12X_DYNAMIC_WORK_SOURCE=persistent_grid
+      - B12X_DYNAMIC_DETERMINISTIC_OUTPUT=0
+      - B12X_DYNAMIC_SPLIT_COMPUTE_MAC=224
+      - B12X_DENSE_SPLITK_TURBO=1
+      - B12X_PCIE_ONESHOT_THREADS=512
+      - B12X_PCIE_ONESHOT_BLOCK_LIMIT=4
+      - B12X_PCIE_ONESHOT_PDL=1
+      - B12X_MHC_PDL=1
+      - NCCL_IB_DISABLE=1
+      - NCCL_P2P_LEVEL=SYS
+      - NCCL_CUMEM_ENABLE=0
+      - NCCL_PROTO=LL,LL128,Simple
+      - NCCL_MIN_NCHANNELS=16
+      - NCCL_MAX_NCHANNELS=16
+      - NCCL_BUFFSIZE=2097152
+      - XDG_CACHE_HOME=/cache
+      - VLLM_CACHE_ROOT=/cache/vllm
+      - VLLM_CACHE_DIR=/cache/vllm
+      - TRITON_CACHE_DIR=/cache/triton
+      - CUTE_DSL_CACHE_DIR=/cache/cute-dsl
+      - B12X_CUTE_COMPILE_CACHE_DIR=/cache/b12x/cute
+      - B12X_COMPILE_CACHE_DIR=/cache/b12x/compile
+      - SPARKINFER_COMPILE_CACHE_DIR=/cache/b12x/compile
+      - TORCHINDUCTOR_CACHE_DIR=/cache/torchinductor
+      - CUDA_CACHE_PATH=/cache/cuda
+      - PYTHONPATH=/app/middleware:/app/plugins:/app/plugins/stats_logger
+      - VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+    entrypoint: ["/bin/bash", "-lc"]
+    command:
+      - >-
+        unset NCCL_GRAPH_FILE;
+        exec /opt/venv/bin/python -m vllm.entrypoints.cli.main
+        serve "$${MODEL}"
+        --served-model-name qwen3.8-27b
+        --api-key "$${LLAMAKEY}"
+        --host 0.0.0.0
+        --port "$${PORT}"
+        --tensor-parallel-size "$${TP}"
+        --pipeline-parallel-size 1
+        --prefix-cache-retention-interval 3008
+        --mamba-cache-mode align
+        --mamba-ssm-cache-dtype auto
+        --enable-prefix-caching
+        --enable-chunked-prefill
+        --async-scheduling
+        --dtype bfloat16
+        --kv-cache-dtype fp8
+        --kv-offloading-size 35.6
+        --enable-cumem-allocator
+        --quantization modelopt_mixed
+        --block-size 64
+        --load-format instanttensor
+        --max-num-seqs 16
+        --max-num-batched-tokens 6019
+        --mm-encoder-tp-mode data
+        --mm-processor-cache-gb 0
+        --speculative-config '{"method":"mtp","num_speculative_tokens":3,"moe_backend":"b12x"}'
+        --gdn-decode-kernel b12x
+        --linear-backend b12x
+        --moe-backend b12x
+        --no-enable-flashinfer-autotune
+        --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}'
+        --max-cudagraph-capture-size 64
+        --reasoning-parser qwen3_clean
+        --reasoning-parser-plugin /app/plugins/qwen_clean_reasoning.py
+        --tool-call-parser qwen3_xml
+        --enable-auto-tool-choice
+        --enable-prompt-tokens-details
+        --chat-template /models/chat_template.jinja
+        --middleware vllm_defaults.FrequencyPenaltyMiddleware
+        --middleware vllm_middleware_strict_tool_calling.StrictToolCallingMiddleware
+        --gpu-memory-utilization 0.92
+        --kv-transfer-config '{"kv_connector":"SimpleCPUOffloadConnector","kv_role":"kv_both","kv_connector_extra_config":{"lazy_offload":true}}'
+    #    --max-model-len 524288
+    #    previous parameter needs proper yarn rope configuration. Patch 005 adds support to yarn on qwen flash 3.8
+    #    changin directly on config.json is fine
+    devices:
+      - "nvidia.com/gpu=all"
+    group_add:
+      - "1"
+      - "2"
+      - "27"
+    x-podman.gidmaps:
+      - "+g1:@100001"
+      - "+g0:@1000"
+      - "g27:@27"
+      - "g100:@28"
+    volumes:
+      - /mnt/models/:/models/:ro
+      - ./files/vllm-fn/cache:/cache:z
+      # Change to your timezone
+      #- /usr/share/zoneinfo/America/Denver:/etc/localtime:ro
+      - ./files/vllm/middleware:/app/middleware
+      - ./files/vllm/plugins:/app/plugins
+      # Fix A (b12x): resident scales + Fix B enablers (_cache_done record, begin_prefetch stage=).
+      - ./files/vllm-fn/patches/006-ple-resident-scales/disk_table.py:/opt/glm53-flash/b12x/b12x/sequence/_shared/disk_table.py:ro
+      - ./files/vllm-fn/patches/006-ple-resident-scales/_disk.py:/opt/glm53-flash/b12x/b12x/sequence/ple_embedding/_disk.py:ro
+      - ./files/vllm-fn/patches/006-ple-resident-scales/_kernels.py:/opt/glm53-flash/b12x/b12x/sequence/ple_embedding/_kernels.py:ro
+      # Fix B (vllm): hosted prefill prefetch; inert while VLLM_PLE_DISK_PREFETCH=0.
+      - ./files/vllm-fn/patches/007-ple-prefetch/ple_layer.py:/opt/glm53-flash/vllm/vllm/models/qwen3_8_flash_next/ple_layer.py:ro
+      - ./files/vllm-fn/patches/007-ple-prefetch/model_state.py:/opt/glm53-flash/vllm/vllm/models/qwen3_8_flash_next/model_state.py:ro
+    healthcheck:
+      test:
+        - CMD
+        - /opt/venv/bin/python
+        - -c
+        - "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:' + os.environ['PORT'] + '/health', timeout=4)"
+      interval: 30s
+      timeout: 5s
+      start_period: 10m
+      retries: 3
+    restart: unless-stopped

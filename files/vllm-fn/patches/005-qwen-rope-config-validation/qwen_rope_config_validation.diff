@@ -1,0 +1,28 @@
+--- a/vllm/models/qwen3_8_flash_next/config.py
++++ b/vllm/models/qwen3_8_flash_next/config.py
+@@ -68,6 +68,10 @@
+ 
+         rope_scaling = kwargs.get("rope_scaling")
+         rope_theta = kwargs.get("rope_theta", 10_000.0)
++        kwargs["ignore_keys_at_rope_validation"] = {
++            "mrope_section",
++            "mrope_interleaved",
++        }
+         super().__init__(layer_types=layer_types, **kwargs)
+ 
+         normalized_rope_parameters = self.rope_parameters
+@@ -245,9 +249,14 @@
+         self.video_token_id = video_token_id
+         self.vision_start_token_id = vision_start_token_id
+         self.vision_end_token_id = vision_end_token_id
++        self.max_position_embeddings = self.text_config.max_position_embeddings
+         self.rope_parameters = rope_parameters or getattr(
+             self.text_config, "rope_parameters", {}
+         )
++        kwargs["ignore_keys_at_rope_validation"] = {
++            "mrope_section",
++            "mrope_interleaved",
++        }
+         super().__init__(**kwargs, tie_word_embeddings=tie_word_embeddings)
+ 
+ 

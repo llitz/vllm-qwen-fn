@@ -1,0 +1,2 @@
+[vllm.stat_logger_plugins]
+prefill_last = statlogger_plugin:PrefillLastStatLogger

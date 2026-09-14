@@ -1,0 +1,4 @@
+Metadata-Version: 2.1
+Name: statlogger-plugin
+Version: 0.1.0
+Summary: vLLM stat-logger plugin exposing the last prefill batch as Prometheus gauges.

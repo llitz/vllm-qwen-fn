@@ -1,0 +1,31 @@
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -2710,17 +2710,22 @@
+                         req_index
+                     ]
+                     assert 0 <= num_draft_tokens <= num_scheduled_draft_tokens
++                num_sampled = self.num_sampled_tokens_per_step
++                num_accepted = max(len(generated_token_ids) - num_sampled, 0)
++                # Acceptance cannot exceed the target-verified window. Grammar
++                # validation can conservatively mark a trailing suffix invalid,
++                # but the sampler may still accept tokens after the grammar
++                # terminates within that window. Keep metrics internally valid
++                # without weakening the verified-window invariant.
++                assert num_accepted <= num_draft_tokens
+                 if scheduler_output.num_invalid_spec_tokens:
+                     num_valid_draft_tokens = num_scheduled_draft_tokens - (
+                         scheduler_output.num_invalid_spec_tokens.get(req_id, 0)
+                     )
+-                    num_draft_tokens = min(
+-                        num_draft_tokens,
+-                        num_valid_draft_tokens,
++                    num_draft_tokens = max(
++                        num_accepted,
++                        min(num_draft_tokens, num_valid_draft_tokens),
+                     )
+-                num_sampled = self.num_sampled_tokens_per_step
+-                num_accepted = max(len(generated_token_ids) - num_sampled, 0)
+-                assert num_accepted <= num_draft_tokens
+                 # Every unaccepted scheduler placeholder must be rolled back,
+                 # including drafts omitted by adaptive verification.
+                 num_rejected = num_scheduled_draft_tokens - num_accepted
