@@ -1,19 +1,17 @@
-# Karmic Kraken beta test service (drizzle).
+# vLLM Karmic Kraken serving service (Qwen3.8-Flash-Next).
 # Image: ghcr.io/local-inference-lab/vllm:karmic-kraken-beta
 #   digest sha256:55e477ad62ae15a77c9b869e8fb8e2d958f6edcc4d95e306adfa89dee9ed19df
-#   pins: vllm@57a80980bb b12x@e9ce547767 (karmic-kraken-beta integration branches)
-# Lineage: ~/srcgit/vllm branch kk-serve-20260920 (ports 008,004,002,001,003)
-#   overlaid below; see ~/randomcoding/vllm/patches/kk/README.md
-# Launch style: mirrors fritz vllm-fn — bypass the lil launcher entirely.
-#   entrypoint overridden; command runs lil-runtime-bootstrap (keeps the LIL
-#   NCCL LD_PRELOAD + CUDA paths) then `python -m vllm.entrypoints.cli.main
-#   serve` directly. All profile/hardware env the launcher would set is
-#   explicit below (captured from `--print-config` of this exact digest).
-# Model: local-inference-lab/Qwen3.8-Flash-Next-NVFP4 (-qad weights) resolved
-#   offline from ./files/models/vllm (snapshot 629bc3218833a38b475b719f34aa571666f4a03e).
-# Startup check: grep the log for "Setting attention block size to N tokens";
-#   N must divide the retention interval (3008 expected on RTX PRO 6000 + b12x;
-#   GB10+flashinfer measures 1600 — do not assume).
+#   pins: vllm@57a80980bb b12x@eea3ced1 (integration/karmic-kraken-beta)
+# Launch: bypasses the image's lil launcher (entrypoint override +
+#   lil-runtime-bootstrap + direct `vllm.entrypoints.cli.main serve`). The
+#   launcher blocks --enable-cumem-allocator / --kv-transfer-config /
+#   --kv-offloading-* as native args; all profile/hardware environment it
+#   would set is declared explicitly below.
+# Model: local-inference-lab/Qwen3.8-Flash-Next-NVFP4 resolved offline from
+#   ./files/models/vllm (HF cache layout).
+# Startup check: the log line "Setting attention block size to N tokens"
+#   must show N dividing --prefix-cache-retention-interval (3008 on RTX PRO
+#   6000 + b12x; other backends differ, e.g. 1600 on GB10 + flashinfer).
 services:
   vllm-kk:
     image: ghcr.io/local-inference-lab/vllm@sha256:55e477ad62ae15a77c9b869e8fb8e2d958f6edcc4d95e306adfa89dee9ed19df
@@ -53,11 +51,10 @@ services:
       - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
       - SAFETENSORS_FAST_GPU=1
       - VLLM_PLE_CPU_OFFLOAD=1
-      # kk profile path: mapped-host PLE tables (~26.8 GiB host RAM).
-      # fritz uses VLLM_PLE_TABLE_MEMORY=disk (io_uring) because lineage
-      # patches 006/007 make disk viable; that surface is absent on kk,
-      # where disk mode is the plain synchronous DiskRowCache path.
-      # TABLE_MEMORY takes precedence over CPU_OFFLOAD, so do not set both.
+      # Mapped-host PLE tables (~26.8 GiB host RAM). The disk path
+      # (VLLM_PLE_TABLE_MEMORY=disk, io_uring) is not used: this branch has
+      # no PLE hosted-prefetch surface, so disk mode is a plain synchronous
+      # row cache. TABLE_MEMORY takes precedence over CPU_OFFLOAD; set one.
       - INSTANTTENSOR_BACKEND=BUFFERED
       - VLLM_COMPUTE_NANS_IN_LOGITS=0
       - VLLM_SSM_CONV_STATE_LAYOUT=DS
@@ -111,7 +108,7 @@ services:
       - ./files/vllm-kk/cache:/cache
       - ./files/vllm-kk/middleware:/app/middleware:ro
       - ./files/vllm-kk/plugins:/app/plugins:ro
-      - ./files/vllm-kk/chat_template.jinja:/app/chat_template.jinja:ro
+      - ./files/templates/qwen/chat_template.jinja:/app/chat_template.jinja:ro
       # lineage ports (kk-serve-20260920) over the installed package
       - ./files/vllm-kk/patches/vllm/v1/core/sched/scheduler.py:/opt/venv/lib/python3.12/site-packages/vllm/v1/core/sched/scheduler.py:ro
       - ./files/vllm-kk/patches/vllm/v1/simple_kv_offload/manager.py:/opt/venv/lib/python3.12/site-packages/vllm/v1/simple_kv_offload/manager.py:ro
