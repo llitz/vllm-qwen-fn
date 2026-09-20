@@ -26,10 +26,12 @@ Required external inputs:
 - `LLAMAKEY` in the environment or `.env` (API key).
 - Model weights at `./files/models/vllm` as an HF cache layout:
   `models--local-inference-lab--Qwen3.8-Flash-Next-NVFP4[-qad]` (resolved
-  offline via `HF_HUB_OFFLINE=1`). Adjust `HF_HUB_CACHE` and the
-  `--chat-template` path to your mount (`/models/vllm/chat_template.jinja`
-  here; `/models/chat_template.jinja` on the fritz layout).
-- Chat template file at the path the compose mounts into the container.
+  offline via `HF_HUB_OFFLINE=1`). Adjust `HF_HUB_CACHE` to your mount.
+
+The chat template is bundled at `files/vllm-kk/chat_template.jinja`
+(md5 `5c928b42a335c295c31789e97713c778`, the froggeric-derived Qwen3.8
+template shared with the fritz vllm-fn deployment) and mounted at
+`/app/chat_template.jinja`.
 
 ## Lineage patches (bind-mounted over site-packages)
 

@@ -111,6 +111,7 @@ services:
       - ./files/vllm-kk/cache:/cache
       - ./files/vllm-kk/middleware:/app/middleware:ro
       - ./files/vllm-kk/plugins:/app/plugins:ro
+      - ./files/vllm-kk/chat_template.jinja:/app/chat_template.jinja:ro
       # lineage ports (kk-serve-20260920) over the installed package
       - ./files/vllm-kk/patches/vllm/v1/core/sched/scheduler.py:/opt/venv/lib/python3.12/site-packages/vllm/v1/core/sched/scheduler.py:ro
       - ./files/vllm-kk/patches/vllm/v1/simple_kv_offload/manager.py:/opt/venv/lib/python3.12/site-packages/vllm/v1/simple_kv_offload/manager.py:ro
@@ -159,7 +160,7 @@ services:
         --tool-call-parser qwen3_xml
         --enable-auto-tool-choice
         --enable-prompt-tokens-details
-        --chat-template /models/vllm/chat_template.jinja
+        --chat-template /app/chat_template.jinja
         --middleware vllm_defaults.FrequencyPenaltyMiddleware
         --middleware vllm_middleware_strict_tool_calling.StrictToolCallingMiddleware
         --max-model-len 524288
