@@ -1,0 +1,168 @@
+# Karmic Kraken beta test service (drizzle).
+# Image: ghcr.io/local-inference-lab/vllm:karmic-kraken-beta
+#   digest sha256:55e477ad62ae15a77c9b869e8fb8e2d958f6edcc4d95e306adfa89dee9ed19df
+#   pins: vllm@57a80980bb b12x@e9ce547767 (karmic-kraken-beta integration branches)
+# Lineage: ~/srcgit/vllm branch kk-serve-20260920 (ports 008,004,002,001,003)
+#   overlaid below; see ~/randomcoding/vllm/patches/kk/README.md
+# Launch style: mirrors fritz vllm-fn — bypass the lil launcher entirely.
+#   entrypoint overridden; command runs lil-runtime-bootstrap (keeps the LIL
+#   NCCL LD_PRELOAD + CUDA paths) then `python -m vllm.entrypoints.cli.main
+#   serve` directly. All profile/hardware env the launcher would set is
+#   explicit below (captured from `--print-config` of this exact digest).
+# Model: local-inference-lab/Qwen3.8-Flash-Next-NVFP4 (-qad weights) resolved
+#   offline from ./files/models/vllm (snapshot 629bc3218833a38b475b719f34aa571666f4a03e).
+# Startup check: grep the log for "Setting attention block size to N tokens";
+#   N must divide the retention interval (3008 expected on RTX PRO 6000 + b12x;
+#   GB10+flashinfer measures 1600 — do not assume).
+services:
+  vllm-kk:
+    image: ghcr.io/local-inference-lab/vllm@sha256:55e477ad62ae15a77c9b869e8fb8e2d958f6edcc4d95e306adfa89dee9ed19df
+    container_name: vllm-kk
+    init: true
+    network_mode: host
+    security_opt:
+      - seccomp=unconfined
+    shm_size: 36g
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    entrypoint: ["/bin/bash", "-lc"]
+    environment:
+      - LLAMAKEY
+      - MODEL=local-inference-lab/Qwen3.8-Flash-Next-NVFP4
+      - PORT=8000
+      - TP=1
+      - HF_HUB_CACHE=/models/vllm
+      - HF_HUB_OFFLINE=1
+      - TRANSFORMERS_OFFLINE=1
+      - VLLM_NO_USAGE_STATS=1
+      - DO_NOT_TRACK=1
+      - OMP_NUM_THREADS=2
+      - CUDA_DEVICE_ORDER=PCI_BUS_ID
+      - VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+      - PYTHONPATH=/app/middleware:/app/plugins:/app/plugins/stats_logger
+      - VLLM_USE_SIMPLE_KV_OFFLOAD=1
+      # REQUIRED: when --kv-offloading-size is set, vllm/config/vllm.py
+      # overwrites the explicit --kv-transfer-config connector with
+      # SimpleCPUOffloadConnector only if this env is set; otherwise it
+      # silently swaps in the complex OffloadingConnector.
+      # --- captured from the image profile (qwen38-flash-next + rtx-pro-6000-pcie) ---
+      - VLLM_USE_V2_MODEL_RUNNER=1
+      - VLLM_WORKER_MULTIPROC_METHOD=spawn
+      - VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+      - SAFETENSORS_FAST_GPU=1
+      - VLLM_PLE_CPU_OFFLOAD=1
+      # kk profile path: mapped-host PLE tables (~26.8 GiB host RAM).
+      # fritz uses VLLM_PLE_TABLE_MEMORY=disk (io_uring) because lineage
+      # patches 006/007 make disk viable; that surface is absent on kk,
+      # where disk mode is the plain synchronous DiskRowCache path.
+      # TABLE_MEMORY takes precedence over CPU_OFFLOAD, so do not set both.
+      - INSTANTTENSOR_BACKEND=BUFFERED
+      - VLLM_COMPUTE_NANS_IN_LOGITS=0
+      - VLLM_SSM_CONV_STATE_LAYOUT=DS
+      - VLLM_DISABLED_KERNELS=MarlinFP8ScaledMMLinearKernel
+      - VLLM_CAUSAL_CONV1D_UPDATE_HOIST=1
+      - VLLM_ENABLE_PCIE_ALLREDUCE=1
+      - VLLM_PCIE_ALLREDUCE_BACKEND=b12x
+      - VLLM_MXFP8_LM_HEAD=0
+      - VLLM_MTP_NVFP4_LM_HEAD=1
+      - VLLM_LM_HEAD_A16=1
+      - VLLM_QWEN3_8_FLASH_NEXT_MTP_COMPACT=1
+      - VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH=1
+      - VLLM_QWEN3_8_FLASH_NEXT_OVERLAP=1
+      - VLLM_B12X_DENSE_ACTIVATION_MODE=auto
+      - CUTE_DSL_ARCH=sm_120a
+      - B12X_DYNAMIC_SPLIT_ROUTE_COMPUTE=1
+      - B12X_DYNAMIC_DIRECT_EXPERT_SCALES=1
+      - B12X_DYNAMIC_SPLIT_LOW_SMEM=1
+      - B12X_DYNAMIC_SKIP_SPLIT_BARRIER_RESET=1
+      - B12X_DYNAMIC_SPLIT_FAST_PREPARE=1
+      - B12X_DYNAMIC_WORK_SOURCE=persistent_grid
+      - B12X_DYNAMIC_DETERMINISTIC_OUTPUT=0
+      - B12X_DYNAMIC_SPLIT_COMPUTE_MAC=224
+      - B12X_DENSE_SPLITK_TURBO=1
+      - B12X_PCIE_ONESHOT_THREADS=512
+      - B12X_PCIE_ONESHOT_BLOCK_LIMIT=4
+      - B12X_PCIE_ONESHOT_PDL=1
+      - B12X_MHC_PDL=1
+      - NCCL_IB_DISABLE=1
+      - NCCL_P2P_LEVEL=SYS
+      - NCCL_CUMEM_ENABLE=0
+      - NCCL_PROTO=LL,LL128,Simple
+      - NCCL_MIN_NCHANNELS=16
+      - NCCL_MAX_NCHANNELS=16
+      - NCCL_BUFFSIZE=2097152
+      # --- JIT caches under the mounted /cache volume ---
+      - XDG_CACHE_HOME=/cache
+      - VLLM_CACHE_ROOT=/cache/vllm
+      - VLLM_CACHE_DIR=/cache/vllm
+      - TRITON_CACHE_DIR=/cache/triton
+      - CUTE_DSL_CACHE_DIR=/cache/cute-dsl
+      - B12X_CUTE_COMPILE_CACHE_DIR=/cache/b12x/cute
+      - B12X_COMPILE_CACHE_DIR=/cache/b12x/compile
+      - SPARKINFER_COMPILE_CACHE_DIR=/cache/b12x/compile
+      - TORCHINDUCTOR_CACHE_DIR=/cache/torchinductor
+      - CUDA_CACHE_PATH=/cache/cuda
+    devices:
+      - "nvidia.com/gpu=all"
+    volumes:
+      - ./files/models:/models:ro
+      - ./files/vllm-kk/cache:/cache
+      - ./files/vllm-kk/middleware:/app/middleware:ro
+      - ./files/vllm-kk/plugins:/app/plugins:ro
+      # lineage ports (kk-serve-20260920) over the installed package
+      - ./files/vllm-kk/patches/vllm/v1/core/sched/scheduler.py:/opt/venv/lib/python3.12/site-packages/vllm/v1/core/sched/scheduler.py:ro
+      - ./files/vllm-kk/patches/vllm/v1/simple_kv_offload/manager.py:/opt/venv/lib/python3.12/site-packages/vllm/v1/simple_kv_offload/manager.py:ro
+      - ./files/vllm-kk/patches/vllm/config/speculative.py:/opt/venv/lib/python3.12/site-packages/vllm/config/speculative.py:ro
+      - ./files/vllm-kk/patches/vllm/entrypoints/openai/chat_completion/protocol.py:/opt/venv/lib/python3.12/site-packages/vllm/entrypoints/openai/chat_completion/protocol.py:ro
+      - ./files/vllm-kk/patches/vllm/entrypoints/openai/completion/protocol.py:/opt/venv/lib/python3.12/site-packages/vllm/entrypoints/openai/completion/protocol.py:ro
+      - ./files/vllm-kk/patches/vllm/models/qwen3_8_flash_next/config.py:/opt/venv/lib/python3.12/site-packages/vllm/models/qwen3_8_flash_next/config.py:ro
+      - ./files/vllm-kk/patches/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py:/opt/venv/lib/python3.12/site-packages/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py:ro
+    command:
+      - >-
+        unset NCCL_GRAPH_FILE;
+        exec /opt/venv/bin/lil-runtime-bootstrap
+        /opt/venv/bin/python -m vllm.entrypoints.cli.main serve "$${MODEL}"
+        --served-model-name qwen3.8-27b
+        --api-key "$${LLAMAKEY}"
+        --host 0.0.0.0
+        --port "$${PORT}"
+        --tensor-parallel-size "$${TP}"
+        --pipeline-parallel-size 1
+        --prefix-cache-retention-interval 3008
+        --mamba-cache-mode align
+        --mamba-ssm-cache-dtype auto
+        --enable-prefix-caching
+        --enable-chunked-prefill
+        --async-scheduling
+        --dtype bfloat16
+        --kv-cache-dtype fp8
+        --kv-offloading-size 35.6
+        --enable-cumem-allocator
+        --quantization modelopt_mixed
+        --block-size 64
+        --load-format instanttensor
+        --max-num-seqs 16
+        --max-num-batched-tokens 6019
+        --mm-encoder-tp-mode data
+        --mm-processor-cache-gb 0
+        --speculative-config '{"method":"mtp","num_speculative_tokens":3,"moe_backend":"b12x"}'
+        --gdn-decode-kernel b12x
+        --linear-backend b12x
+        --moe-backend b12x
+        --no-enable-flashinfer-autotune
+        --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}'
+        --max-cudagraph-capture-size 64
+        --reasoning-parser qwen3_clean
+        --reasoning-parser-plugin /app/plugins/qwen_clean_reasoning.py
+        --tool-call-parser qwen3_xml
+        --enable-auto-tool-choice
+        --enable-prompt-tokens-details
+        --chat-template /models/vllm/chat_template.jinja
+        --middleware vllm_defaults.FrequencyPenaltyMiddleware
+        --middleware vllm_middleware_strict_tool_calling.StrictToolCallingMiddleware
+        --max-model-len 524288
+        --kv-transfer-config '{"kv_connector":"SimpleCPUOffloadConnector","kv_role":"kv_both","kv_connector_extra_config":{"lazy_offload":true}}'
+        --kv-cache-memory-bytes 15490411776
+    restart: unless-stopped
