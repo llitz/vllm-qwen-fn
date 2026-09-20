@@ -17,7 +17,6 @@ services:
     image: ghcr.io/local-inference-lab/vllm@sha256:55e477ad62ae15a77c9b869e8fb8e2d958f6edcc4d95e306adfa89dee9ed19df
     container_name: vllm-kk
     init: true
-    network_mode: host
     security_opt:
       - seccomp=unconfined
     shm_size: 36g
@@ -163,4 +162,16 @@ services:
         --max-model-len 524288
         --kv-transfer-config '{"kv_connector":"SimpleCPUOffloadConnector","kv_role":"kv_both","kv_connector_extra_config":{"lazy_offload":true}}'
         --kv-cache-memory-bytes 15490411776
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test:
+        - CMD
+        - /opt/venv/bin/python
+        - -c
+        - "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:' + os.environ['PORT'] + '/health', timeout=4)"
+      interval: 30s
+      timeout: 5s
+      start_period: 10m
+      retries: 3
     restart: unless-stopped
