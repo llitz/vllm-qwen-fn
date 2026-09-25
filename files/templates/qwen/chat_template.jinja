@@ -14,7 +14,7 @@
 {%- endif %}
 {%- set max_tool_arg_chars = max_tool_arg_chars if max_tool_arg_chars is defined else 0 %}
 {%- set max_tool_response_chars = max_tool_response_chars if max_tool_response_chars is defined else 0 %}
-{%- set _default_reasoning_effort = 'medium' %}
+{%- set _default_reasoning_effort = 'xhigh' %}
 {%- set _has_tools = (tools is defined and tools and tools is iterable and tools is not mapping) %}
 {%- set _effort_raw = (reasoning_effort | string | lower) if reasoning_effort is defined and reasoning_effort is not none else _default_reasoning_effort %}
 {%- set _initial_thinking = enable_thinking %}
@@ -23,7 +23,9 @@
     {%- set _initial_effort = 'medium' %}
 {%- elif _effort_raw in ('minimal', 'low') %}
     {%- set _initial_effort = 'low' %}
-{%- elif _effort_raw in ('high', 'xhigh', 'max', 'ultracode', 'extreme') %}
+{%- elif _effort_raw in ('high') %}
+    {%- set _initial_effort = 'high' %}
+{%- elif _effort_raw in ('xhigh', 'max', 'ultracode', 'extreme') %}
     {%- set _initial_effort = 'xhigh' %}
 {%- else %}
     {%- set _initial_effort = 'medium' %}
@@ -39,9 +41,12 @@
                 {%- set ns_state.thinking = false %}
             {%- elif '<|think_on|>' in msg.content %}
                 {%- set ns_state.thinking = true %}
-            {%- elif '<|think_xhigh|>' in msg.content or '<|think_high|>' in msg.content or '<|think_ultracode|>' in msg.content or '<|think_extreme|>' in msg.content or '<|think_max|>' in msg.content %}
+            {%- elif '<|think_xhigh|>' in msg.content or '<|think_ultracode|>' in msg.content or '<|think_extreme|>' in msg.content or '<|think_max|>' in msg.content %}
                 {%- set ns_state.thinking = true %}
                 {%- set ns_state.effort = 'xhigh' %}
+            {%- elif '<|think_high|>' in _item_text %}
+                {%- set ns_state.thinking = true %}
+                {%- set ns_state.effort = 'high' %}
             {%- elif '<|think_low|>' in msg.content or '<|think_minimal|>' in msg.content %}
                 {%- set ns_state.thinking = true %}
                 {%- set ns_state.effort = 'low' %}
@@ -63,9 +68,12 @@
                         {%- set ns_state.thinking = false %}
                     {%- elif '<|think_on|>' in _item_text %}
                         {%- set ns_state.thinking = true %}
-                    {%- elif '<|think_xhigh|>' in _item_text or '<|think_high|>' in _item_text or '<|think_ultracode|>' in _item_text or '<|think_extreme|>' in _item_text or '<|think_max|>' in _item_text %}
+                    {%- elif '<|think_xhigh|>' in _item_text or '<|think_ultracode|>' in _item_text or '<|think_extreme|>' in _item_text or '<|think_max|>' in _item_text %}
                         {%- set ns_state.thinking = true %}
                         {%- set ns_state.effort = 'xhigh' %}
+                    {%- elif '<|think_high|>' in _item_text %}
+                        {%- set ns_state.thinking = true %}
+                        {%- set ns_state.effort = 'high' %}
                     {%- elif '<|think_low|>' in _item_text or '<|think_minimal|>' in _item_text %}
                         {%- set ns_state.thinking = true %}
                         {%- set ns_state.effort = 'low' %}
@@ -82,6 +90,8 @@
 {%- if ns_state.thinking %}
     {%- if ns_state.effort == 'xhigh' %}
         {%- set reasoning_instructions = 'Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.' %}
+    {%- elif ns_state.effort == 'high' %}
+        {%- set reasoning_instructions = 'Reasoning effort is set to halfway between low and xhigh. Please think careful but brief, validate key assumptions but keep it brief, and move quickly to the conclusion without unnecessary elaboration.' %}
     {%- elif ns_state.effort == 'low' %}
         {%- set reasoning_instructions = 'Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.' %}
     {%- endif %}

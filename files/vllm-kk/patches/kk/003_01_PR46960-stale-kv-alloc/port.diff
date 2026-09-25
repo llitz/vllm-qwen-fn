@@ -1,0 +1,107 @@
+From 5edc5f6411d933e9feaa8150e68ab0be1c6f3353 Mon Sep 17 00:00:00 2001
+From: Carlos Augusto <mb@lab.how>
+Date: Wed, 23 Sep 2026 14:08:24 -0600
+Subject: [PATCH] [KV Connector] Track allocated KV blocks before early return
+
+OffloadingConnectorScheduler.update_state_after_alloc returned early when
+num_external_tokens == 0 without recording the newly allocated blocks in
+_current_batch_allocated_block_ids. Untracked blocks could be reallocated to
+another request while an in-flight CPU load still referenced them, producing
+cross-request KV corruption (answers mixing conversations) on
+MultiConnector / zero-token-load configurations.
+
+Fix: record every non-null allocation through _record_allocated_blocks before
+the early return, and drop the redundant per-group inline update.
+
+Attribution: this is a verbatim port of vllm-project/vllm#46960 (issue
+#46951), author yinli-systems, which is still open as a draft. The hunks are
+upstream's, not ours; carry patch-id c0f42a7bfc6ca4a3a2cf4de893d33e3b3529a2be
+to match them after upstream rebases or squash-merges. Drop this commit once
+the PR lands and karmic rebases onto it. It applies to karmic unchanged
+because the group-indexed traversal (blocks.blocks[group_config.group_idx])
+that karmic carries is already the shape the rebased PR diff targets.
+
+Includes the PR's regression test (multiple cache groups, null block ID 0) in
+tests/v1/kv_connector/unit/offloading_connector/test_scheduler.py.
+
+Live only under the complex OffloadingConnector (VLLM_USE_SIMPLE_KV_OFFLOAD=0);
+inert under SimpleCPUOffloadConnector.
+---
+ .../offloading_connector/test_scheduler.py    | 22 +++++++++++++++++++
+ .../kv_connector/v1/offloading/scheduler.py   | 13 +++++++----
+ 2 files changed, 31 insertions(+), 4 deletions(-)
+
+diff --git a/tests/v1/kv_connector/unit/offloading_connector/test_scheduler.py b/tests/v1/kv_connector/unit/offloading_connector/test_scheduler.py
+index 9693c36bea..a368673660 100644
+--- a/tests/v1/kv_connector/unit/offloading_connector/test_scheduler.py
++++ b/tests/v1/kv_connector/unit/offloading_connector/test_scheduler.py
+@@ -2136,6 +2136,28 @@ def test_fence_at_update_state_after_alloc(request_runner):
+     assert runner.connector_scheduler._block_id_to_pending_jobs == {}
+ 
+ 
++def test_update_state_after_alloc_records_zero_token_allocations():
++    scheduler = object.__new__(OffloadingConnectorScheduler)
++    scheduler._current_batch_allocated_block_ids = set()
++    blocks = KVCacheBlocks(
++        (
++            (
++                KVCacheBlock(block_id=7),
++                KVCacheBlock(block_id=0),
++            ),
++            (KVCacheBlock(block_id=11),),
++        )
++    )
++
++    scheduler.update_state_after_alloc(
++        SimpleNamespace(request_id="req-0"),
++        blocks,
++        num_external_tokens=0,
++    )
++
++    assert scheduler._current_batch_allocated_block_ids == {7, 11}
++
++
+ def test_fence_at_build_store_jobs(request_runner):
+     """A new prefill (no load -> update_state_after_alloc returns early)
+     reusing a finished request's pending-store block is flushed by
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+index ff31c12da5..8e5f6ccf16 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+@@ -1115,6 +1115,7 @@ class OffloadingConnectorScheduler:
+     def update_state_after_alloc(
+         self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int
+     ):
++        self._record_allocated_blocks(blocks)
+         if num_external_tokens == 0:
+             return
+ 
+@@ -1136,10 +1137,6 @@ class OffloadingConnectorScheduler:
+             req_status.group_states,
+         ):
+             group_blocks = blocks.blocks[group_config.group_idx]
+-            self._current_batch_allocated_block_ids.update(
+-                block.block_id for block in group_blocks if block.block_id != 0
+-            )
+-
+             tokens_per_block = group_config.tokens_per_block
+             tokens_per_chunk = group_config.tokens_per_chunk
+             offload_keys = group_state.offload_keys
+@@ -1228,6 +1225,14 @@ class OffloadingConnectorScheduler:
+             self._chunks_being_loaded.update(keys_to_load)
+         req_status.partial_tail_boundary = None
+ 
++    def _record_allocated_blocks(self, blocks: KVCacheBlocks) -> None:
++        self._current_batch_allocated_block_ids.update(
++            block.block_id
++            for group_blocks in blocks.blocks
++            for block in group_blocks
++            if block.block_id != 0
++        )
++
+     def _update_req_states(self, scheduler_output: SchedulerOutput) -> None:
+         """
+         Update request states from the Scheduler's output.
+-- 
+2.55.0
+

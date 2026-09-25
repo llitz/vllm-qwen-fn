@@ -1,0 +1,7 @@
+ae9cd6b7fbb0df796c9287141b5b97b0f6ee4e20 Preserve accepted speculative grammar tails in metrics
+07d86daa71cc03f895659ad0d144a697c53b9b87 Add opt-in output-token budget clamping
+5edc5f6411d933e9feaa8150e68ab0be1c6f3353 [KV Connector] Track allocated KV blocks before early return
+d2a8d6c0a04cca23d517d049c52da5c6c7b9d9db Mirror Qwen3.8 text max_position_embeddings onto composite config
+b8d279785be80c41b323374a135528c1c4ef99a8 [KV Connector] Keep group store ranges aligned across skipped CoW groups
+ef1805bb4bf1b7b6656f42b68c2a07896d2745d6 [KV Connector] Serve external prefix hits for align-mode Mamba hybrids
+5942b493c3eb44ad3bb30e6d8b2b1e4dd4d9b09a [Config] Exempt explicit aligned retention from the atomic checkpoint requirement

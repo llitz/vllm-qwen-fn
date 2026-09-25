@@ -1,0 +1,91 @@
+From ae9cd6b7fbb0df796c9287141b5b97b0f6ee4e20 Mon Sep 17 00:00:00 2001
+From: Carlos Augusto <mb@lab.how>
+Date: Sat, 19 Sep 2026 21:11:31 -0600
+Subject: [PATCH] Preserve accepted speculative grammar tails in metrics
+
+Port of lineage patch 008 (tip commit 9e6808c614) onto karmic-kraken-beta.
+Grammar validation can conservatively mark a trailing draft suffix invalid
+while the sampler still accepts tokens within the target-verified window;
+the old min() floor then made the accepted-count assertion fire. Keep the
+hard verified-window bound and floor the grammar-adjusted count at the
+accepted count instead.
+
+Regression test: tests/v1/core/test_scheduler.py
+::test_spec_decode_metrics_preserve_accepted_grammar_tail
+---
+ tests/v1/core/test_scheduler.py | 17 +++++++++++++++++
+ vllm/v1/core/sched/scheduler.py | 21 +++++++++++++--------
+ 2 files changed, 30 insertions(+), 8 deletions(-)
+
+diff --git a/tests/v1/core/test_scheduler.py b/tests/v1/core/test_scheduler.py
+index 93e1d7d414..ef11f43b3f 100644
+--- a/tests/v1/core/test_scheduler.py
++++ b/tests/v1/core/test_scheduler.py
+@@ -2014,6 +2014,23 @@ def test_per_request_spec_decode_subtracts_invalid_drafts():
+     assert payload["acceptance_histogram"] == [0, 0, 1, 0]
+ 
+ 
++
++def test_spec_decode_metrics_preserve_accepted_grammar_tail():
++    scheduler = create_scheduler(
++        num_speculative_tokens=3,
++        per_request_spec_decode_metrics="summary",
++    )
++    req = _run_spec_verify_steps(
++        scheduler,
++        [([1, 2, 3], [1, 2, 5])],
++        num_invalid_per_round=[2],
++    )
++    payload = scheduler.requests[req.request_id].spec_decode_metrics.to_dict()
++    assert payload["num_draft_tokens"] == 2
++    assert payload["num_accepted_draft_tokens"] == 2
++    assert payload["acceptance_histogram"] == [0, 0, 1, 0]
++
++
+ def test_per_request_spec_decode_acceptance_disabled_by_default():
+     scheduler = create_scheduler(num_speculative_tokens=3)
+     assert scheduler.spec_decode_metrics_level == "none"
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 6e5ea6d15b..e51cf97308 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -2822,16 +2822,13 @@ class Scheduler(SchedulerInterface):
+                         req_index
+                     ]
+                     assert 0 <= num_draft_tokens <= num_scheduled_draft_tokens
+-                if scheduler_output.num_invalid_spec_tokens:
+-                    num_valid_draft_tokens = num_scheduled_draft_tokens - (
+-                        scheduler_output.num_invalid_spec_tokens.get(req_id, 0)
+-                    )
+-                    num_draft_tokens = min(
+-                        num_draft_tokens,
+-                        num_valid_draft_tokens,
+-                    )
+                 num_sampled = self.num_sampled_tokens_per_step
+                 num_accepted = max(len(generated_token_ids) - num_sampled, 0)
++                # Acceptance cannot exceed the target-verified window. Grammar
++                # validation can conservatively mark a trailing suffix invalid,
++                # but the sampler may still accept tokens after the grammar
++                # terminates within that window. Keep metrics internally valid
++                # without weakening the verified-window invariant.
+                 assert num_accepted <= num_draft_tokens, (
+                     f"{req_id}: accepted={num_accepted}, "
+                     f"valid_drafts={num_draft_tokens}, "
+@@ -2839,6 +2836,14 @@ class Scheduler(SchedulerInterface):
+                     f"grammar_invalid="
+                     f"{(scheduler_output.num_invalid_spec_tokens or {}).get(req_id, 0)}"
+                 )
++                if scheduler_output.num_invalid_spec_tokens:
++                    num_valid_draft_tokens = num_scheduled_draft_tokens - (
++                        scheduler_output.num_invalid_spec_tokens.get(req_id, 0)
++                    )
++                    num_draft_tokens = max(
++                        num_accepted,
++                        min(num_draft_tokens, num_valid_draft_tokens),
++                    )
+                 # Every unaccepted scheduler placeholder must be rolled back,
+                 # including drafts omitted by adaptive verification.
+                 num_rejected = num_scheduled_draft_tokens - num_accepted
+-- 
+2.55.0
+

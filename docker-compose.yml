@@ -1,20 +1,36 @@
-# vLLM Karmic Kraken serving service (Qwen3.8-Flash-Next).
-# Image: ghcr.io/local-inference-lab/vllm:karmic-kraken-beta
-#   digest sha256:55e477ad62ae15a77c9b869e8fb8e2d958f6edcc4d95e306adfa89dee9ed19df
-#   pins: vllm@57a80980bb b12x@eea3ced1 (integration/karmic-kraken-beta)
-# Launch: bypasses the image's lil launcher (entrypoint override +
-#   lil-runtime-bootstrap + direct `vllm.entrypoints.cli.main serve`). The
-#   launcher blocks --enable-cumem-allocator / --kv-transfer-config /
-#   --kv-offloading-* as native args; all profile/hardware environment it
-#   would set is declared explicitly below.
+# Karmic Kraken (kk) — karmic-kraken-beta base + 7-diff patch chain, baked.
+# Image: localhost/vllm-kk:kk-20260923, built from ./Dockerfile.vllm-kk
+#   (compose `build:` runs automatically when the image is absent; the
+#   in-image manifest.sha256 check ties the build to the exact chain in
+#   files/vllm-kk/patches/kk/).
+# Base: ghcr.io/local-inference-lab/vllm
+#   @sha256:445c58f040c7804e2bf795c3fe6250c1d13a48cd6ea6855e526f280906f8302e
+#   (tag karmic-kraken-beta-20260923-23a6d60a4b49c403; pins vllm@ccfef884dd).
+# Chain: 008,001,003_01_PR46960,005,003_02,003_03,003_04 (individual
+#   port.diffs; provenance in files/vllm-kk/patches/kk/chain.txt).
+#   003_04 exempts explicit aligned retention from PR #864's
+#   atomic-connector gate — REQUIRES --recurrent-checkpoint-policy aligned
+#   below; without the flag the gate still raises on Qwen model types.
+# KV connector: complex OffloadingConnector (VLLM_USE_SIMPLE_KV_OFFLOAD=0 +
+#   explicit --kv-transfer-config). The 003 pack targets this connector;
+#   under SimpleCPUOffloadConnector the pack is inert.
+# Launch: bypasses the lil launcher (entrypoint override;
+#   lil-runtime-bootstrap then direct `vllm.entrypoints.cli.main serve`).
 # Model: local-inference-lab/Qwen3.8-Flash-Next-NVFP4 resolved offline from
-#   ./files/models/vllm (HF cache layout).
-# Startup check: the log line "Setting attention block size to N tokens"
-#   must show N dividing --prefix-cache-retention-interval (3008 on RTX PRO
-#   6000 + b12x; other backends differ, e.g. 1600 on GB10 + flashinfer).
+#   ./files/models/vllm.
+# Startup check: grep the log for "Setting attention block size to N
+#   tokens"; N must divide --prefix-cache-retention-interval (3008 expected
+#   on RTX PRO 6000 + b12x).
+# Runtime bind mounts (read-only): ./files/vllm-kk/middleware ->
+#   /app/middleware, ./files/vllm-kk/plugins -> /app/plugins,
+#   ./files/vllm-kk/cache -> /cache (JIT caches), chat template from
+#   ./files/models/vllm/chat_template.jinja.
 services:
   vllm-kk:
-    image: ghcr.io/local-inference-lab/vllm@sha256:55e477ad62ae15a77c9b869e8fb8e2d958f6edcc4d95e306adfa89dee9ed19df
+    build:
+      context: .
+      dockerfile: Dockerfile.vllm-kk
+    image: localhost/vllm-kk:kk-20260923
     container_name: vllm-kk
     init: true
     security_opt:
@@ -38,22 +54,13 @@ services:
       - CUDA_DEVICE_ORDER=PCI_BUS_ID
       - VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
       - PYTHONPATH=/app/middleware:/app/plugins:/app/plugins/stats_logger
-      - VLLM_USE_SIMPLE_KV_OFFLOAD=1
-      # REQUIRED: when --kv-offloading-size is set, vllm/config/vllm.py
-      # overwrites the explicit --kv-transfer-config connector with
-      # SimpleCPUOffloadConnector only if this env is set; otherwise it
-      # silently swaps in the complex OffloadingConnector.
-      # --- captured from the image profile (qwen38-flash-next + rtx-pro-6000-pcie) ---
+      - VLLM_USE_SIMPLE_KV_OFFLOAD=0
       - VLLM_USE_V2_MODEL_RUNNER=1
       - VLLM_WORKER_MULTIPROC_METHOD=spawn
       - VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0
       - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
       - SAFETENSORS_FAST_GPU=1
       - VLLM_PLE_CPU_OFFLOAD=1
-      # Mapped-host PLE tables (~26.8 GiB host RAM). The disk path
-      # (VLLM_PLE_TABLE_MEMORY=disk, io_uring) is not used: this branch has
-      # no PLE hosted-prefetch surface, so disk mode is a plain synchronous
-      # row cache. TABLE_MEMORY takes precedence over CPU_OFFLOAD; set one.
       - INSTANTTENSOR_BACKEND=BUFFERED
       - VLLM_COMPUTE_NANS_IN_LOGITS=0
       - VLLM_SSM_CONV_STATE_LAYOUT=DS
@@ -107,15 +114,6 @@ services:
       - ./files/vllm-kk/cache:/cache
       - ./files/vllm-kk/middleware:/app/middleware:ro
       - ./files/vllm-kk/plugins:/app/plugins:ro
-      - ./files/templates/qwen/chat_template.jinja:/app/chat_template.jinja:ro
-      # lineage ports (kk-serve-20260920) over the installed package
-      - ./files/vllm-kk/patches/vllm/v1/core/sched/scheduler.py:/opt/venv/lib/python3.12/site-packages/vllm/v1/core/sched/scheduler.py:ro
-      - ./files/vllm-kk/patches/vllm/v1/simple_kv_offload/manager.py:/opt/venv/lib/python3.12/site-packages/vllm/v1/simple_kv_offload/manager.py:ro
-      - ./files/vllm-kk/patches/vllm/config/speculative.py:/opt/venv/lib/python3.12/site-packages/vllm/config/speculative.py:ro
-      - ./files/vllm-kk/patches/vllm/entrypoints/openai/chat_completion/protocol.py:/opt/venv/lib/python3.12/site-packages/vllm/entrypoints/openai/chat_completion/protocol.py:ro
-      - ./files/vllm-kk/patches/vllm/entrypoints/openai/completion/protocol.py:/opt/venv/lib/python3.12/site-packages/vllm/entrypoints/openai/completion/protocol.py:ro
-      - ./files/vllm-kk/patches/vllm/models/qwen3_8_flash_next/config.py:/opt/venv/lib/python3.12/site-packages/vllm/models/qwen3_8_flash_next/config.py:ro
-      - ./files/vllm-kk/patches/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py:/opt/venv/lib/python3.12/site-packages/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py:ro
     command:
       - >-
         unset NCCL_GRAPH_FILE;
@@ -129,6 +127,7 @@ services:
         --pipeline-parallel-size 1
         --prefix-cache-retention-interval 3008
         --mamba-cache-mode align
+        --recurrent-checkpoint-policy aligned
         --mamba-ssm-cache-dtype auto
         --enable-prefix-caching
         --enable-chunked-prefill
@@ -156,11 +155,11 @@ services:
         --tool-call-parser qwen3_xml
         --enable-auto-tool-choice
         --enable-prompt-tokens-details
-        --chat-template /app/chat_template.jinja
+        --chat-template /models/vllm/chat_template.jinja
         --middleware vllm_defaults.FrequencyPenaltyMiddleware
         --middleware vllm_middleware_strict_tool_calling.StrictToolCallingMiddleware
         --max-model-len 524288
-        --kv-transfer-config '{"kv_connector":"SimpleCPUOffloadConnector","kv_role":"kv_both","kv_connector_extra_config":{"lazy_offload":true}}'
+        --kv-transfer-config '{"kv_connector":"OffloadingConnector","kv_role":"kv_both"}'
         --kv-cache-memory-bytes 15490411776
     ports:
       - "8000:8000"

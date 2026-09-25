@@ -1,0 +1,156 @@
+From d2a8d6c0a04cca23d517d049c52da5c6c7b9d9db Mon Sep 17 00:00:00 2001
+From: Carlos Augusto <mb@lab.how>
+Date: Sat, 19 Sep 2026 22:31:33 -0600
+Subject: [PATCH] Mirror Qwen3.8 text max_position_embeddings onto composite
+ config
+
+Port of lineage patch 005 (tip commit 1d15136507) onto karmic-kraken-beta.
+The checkpoint carries max_position_embeddings and the M-RoPE metadata
+(mrope_section, mrope_interleaved) only inside text_config. transformers
+v5 rope standardization reads self.max_position_embeddings during
+__post_init__ (before undeclared kwargs are assigned) and rejects the
+M-RoPE keys as unrecognized, so config parsing crashed with
+'Qwen3_8FlashNextConfig object has no attribute max_position_embeddings'.
+
+kk drift: the tip patched a standalone qwen3_8 config module; on kk it is
+a subclass shell over qwen4_exp. The mirror must therefore set the
+attribute on self before super().__init__ (kwargs-only placement is too
+late for the v5 dataclass post-init path) and pass
+ignore_keys_at_rope_validation via kwargs.
+
+Regression test: tests/models/test_qwen3_8_flash_next_rope_config.py
+(4 passed in-image at 57a80980bb).
+---
+ .../test_qwen3_8_flash_next_rope_config.py    | 75 +++++++++++++++++++
+ vllm/models/qwen3_8_flash_next/config.py      | 26 +++++++
+ 2 files changed, 101 insertions(+)
+ create mode 100644 tests/models/test_qwen3_8_flash_next_rope_config.py
+
+diff --git a/tests/models/test_qwen3_8_flash_next_rope_config.py b/tests/models/test_qwen3_8_flash_next_rope_config.py
+new file mode 100644
+index 0000000000..6c9c2a368d
+--- /dev/null
++++ b/tests/models/test_qwen3_8_flash_next_rope_config.py
+@@ -0,0 +1,75 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""CPU-only regression tests for the Qwen3.8-Flash-Next rope config port.
++
++Lineage patch 005 on karmic-kraken-beta: the checkpoint carries
++``max_position_embeddings`` and the M-RoPE metadata only inside
++``text_config``. transformers' rope validation (YaRN implicit-factor check)
++and vLLM's max-position retrieval read the attribute on the composite
++config, so the composite must mirror it, and the vLLM-side M-RoPE keys
++(``mrope_section``, ``mrope_interleaved``) must be ignored by rope
++validation instead of raising "Unrecognized keys in rope_parameters".
++"""
++
++from vllm.models.qwen3_8_flash_next.config import (
++    Qwen3_8FlashNextConfig,
++    Qwen3_8FlashNextTextConfig,
++)
++
++_TEXT_CONFIG = {
++    "hidden_size": 64,
++    "num_hidden_layers": 2,
++    "num_attention_heads": 4,
++    "num_key_value_heads": 1,
++    "head_dim": 16,
++    "intermediate_size": 128,
++    "vocab_size": 256,
++    "layer_types": ["full_attention", "linear_attention"],
++    "hc_count": 4,
++    "max_position_embeddings": 524288,
++    "rope_parameters": {
++        "rope_type": "yarn",
++        "factor": 4.0,
++        "original_max_position_embeddings": 262144,
++        "mrope_section": [16, 24, 24],
++        "mrope_interleaved": True,
++    },
++}
++
++
++def _composite() -> Qwen3_8FlashNextConfig:
++    return Qwen3_8FlashNextConfig(
++        text_config=dict(_TEXT_CONFIG),
++        vision_config={},
++    )
++
++
++def test_composite_mirrors_text_max_position_embeddings():
++    config = _composite()
++    # The crash being fixed: attribute access on the composite must work and
++    # must equal the text config value (checkpoint carries it only there).
++    assert config.max_position_embeddings == 524288
++    assert config.text_config.max_position_embeddings == 524288
++
++
++def test_rope_validation_ignores_mrope_metadata():
++    # Constructing with mrope_* keys must not raise; validation ignores them.
++    config = _composite()
++    ignored = config.ignore_keys_at_rope_validation
++    assert {"mrope_section", "mrope_interleaved"} <= set(
++        ignored if isinstance(ignored, (set, list, tuple)) else {ignored}
++    )
++
++
++def test_text_config_accepts_mrope_metadata():
++    text = Qwen3_8FlashNextTextConfig(**_TEXT_CONFIG)
++    assert text.rope_parameters["mrope_section"] == [16, 24, 24]
++
++
++def test_explicit_composite_max_position_wins():
++    config = Qwen3_8FlashNextConfig(
++        text_config=dict(_TEXT_CONFIG),
++        vision_config={},
++        max_position_embeddings=131072,
++    )
++    assert config.max_position_embeddings == 131072
+diff --git a/vllm/models/qwen3_8_flash_next/config.py b/vllm/models/qwen3_8_flash_next/config.py
+index d00d4c5946..4713f1f4de 100644
+--- a/vllm/models/qwen3_8_flash_next/config.py
++++ b/vllm/models/qwen3_8_flash_next/config.py
+@@ -25,6 +25,12 @@ class Qwen3_8FlashNextTextConfig(Qwen4ExpTextConfig):
+     supports_full_tp_dcp_with_kv_gather = True
+ 
+     def __init__(self, **kwargs: Any) -> None:
++        # M-RoPE metadata keys are vLLM-side extensions; transformers'
++        # rope validation must not reject them (lineage patch 005).
++        kwargs["ignore_keys_at_rope_validation"] = {
++            "mrope_section",
++            "mrope_interleaved",
++        }
+         super().__init__(**kwargs)
+ 
+ 
+@@ -36,6 +42,26 @@ class Qwen3_8FlashNextConfig(Qwen4ExpConfig):
+     }
+ 
+     def __init__(self, **kwargs: Any) -> None:
++        # Mirror the text config's context limit onto the composite (lineage
++        # patch 005, adapted to the qwen4_exp subclass shell). The checkpoint
++        # carries max_position_embeddings only inside text_config, but
++        # transformers v5 rope standardization reads
++        # self.max_position_embeddings during __post_init__, before undeclared
++        # kwargs are assigned — so set the attribute directly on self, and
++        # pass the M-RoPE metadata keys via kwargs where they are declared.
++        text_config = kwargs.get("text_config")
++        if isinstance(text_config, dict):
++            text_max_pos = text_config.get("max_position_embeddings")
++        else:
++            text_max_pos = getattr(text_config, "max_position_embeddings", None)
++        if kwargs.get("max_position_embeddings") is None and text_max_pos is not None:
++            kwargs["max_position_embeddings"] = text_max_pos
++        if kwargs.get("max_position_embeddings") is not None:
++            self.max_position_embeddings = kwargs["max_position_embeddings"]
++        kwargs["ignore_keys_at_rope_validation"] = {
++            "mrope_section",
++            "mrope_interleaved",
++        }
+         super().__init__(**kwargs)
+ 
+ 
+-- 
+2.55.0
+

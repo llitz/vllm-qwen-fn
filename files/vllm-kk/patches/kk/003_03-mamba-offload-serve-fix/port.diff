@@ -1,0 +1,2301 @@
+From ef1805bb4bf1b7b6656f42b68c2a07896d2745d6 Mon Sep 17 00:00:00 2001
+From: Carlos Augusto <mb@lab.how>
+Date: Wed, 23 Sep 2026 14:08:24 -0600
+Subject: [PATCH] [KV Connector] Serve external prefix hits for align-mode
+ Mamba hybrids
+
+With the complex OffloadingConnector enabled for a hybrid model that has
+align-mode Mamba groups (Qwen3.8-Flash-Next: 50 KV cache groups, 13 of them
+GDN recurrent state), multi-turn serving corrupts deterministically at
+temp=0: the cold turn (cached_tokens=0) answers correctly; every later turn
+with a prefix hit answers a generic greeting or nothing, with no assert and
+a healthy engine. The model reads its own context as empty. Inert under
+SimpleCPUOffloadConnector, which never stores Mamba groups.
+
+Two independent defects on the external-hit path:
+
+1. Stale boundary capture. Align-mode Mamba migrates its state column once
+   per step, pre-forward. A chunked-prefill step computes an entire chunk at
+   once (e.g. tokens 6016..9101 in the step starting at nct=6016), so the
+   column ends the step holding the chunk-END state; the intermediate
+   retention-boundary state (9024) never exists in any column. The
+   connector's deferred store DMA faithfully copied the chunk-end state and
+   filed it under the boundary key. On resume, the request recomputed the
+   chunk tail on top of a state that already included it: recurrent-state
+   double-processing.
+
+2. Untransported padded tail. QSA attention groups pad their pages; the
+   compressed-K selector tail is the [unpadded, padded) region (192,512 B
+   here), read by selection through compressed_block_table. Narrow transfer
+   refs carried the unpadded page size, so that region was never DMA'd in
+   either direction: a resumed request selected against an empty tail while
+   every copied byte looked correct.
+
+Fix:
+- Boundary stores source dedicated capture blocks, written once by the
+  boundary-checkpoint crossing copy and manager-pinned from offer until store
+  ack or drop; captures recorded after their producing step completed are
+  withheld. Pins release on every store drop path (out-of-bounds, allocation
+  failure, key dedup, stale-ack drain with live-fence guard), and
+  block-multiple geometry is asserted at record and config sites.
+- Attention transfer refs carry the full padded page
+  (spec.page_size_bytes); store and load share one size source; canonical ref
+  width comes from each layer's own group spec (a stale loop variable made
+  the padded-tail transport silently no-op on hybrid layouts whose last
+  group is Mamba); Mamba refs keep the unpadded width.
+- The QSA selector pool fresh flag is derived from the restored-checkpoint
+  signal at add time and cleared on boundary
+  (get_recurrent_checkpoint_fresh); the anchor seeds to prefix-1. GLM-Next
+  mirrors the gating. Local hits and non-offload paths keep stock
+  always-fresh behavior.
+- The external hit extends to the deepest boundary every group keys, never a
+  half-restore.
+
+Tests ship with the patch: crossing-capture digest identity, pin release on
+store-ack and every offer-drop path, hit-gate convergence, padded-ref
+register width per backend plus a GPU<->CPU DMA roundtrip, QSA fresh gating
+on cold/resume/local-hit adds, store-key dedup, and the b12x GDN prefill
+checkpoint clone.
+
+Live serving validation (drizzle, RTX PRO 6000, temp=0, seed4+fixed nonce,
+GPU cache capped at ~49,955 tokens so a resend of eight ~10.4k-token prompts
+cannot fit in GPU): regular phase 9/9 correct, resume sends
+cached_tokens=9024, corrupted=0; evict phase serving=8/8 correct=8/8 with
+all B-resends at cached=9024 from the CPU tier. Pre-patch on the same model
+and config: the first store of a large prompt crashed the engine (fixed by
+the CoW alignment commit), and for requests that did complete stores, every
+prefix-hit turn served a deterministic wrong answer.
+
+Depends on: the block-tracking commit in this series, a port of
+vllm-project/vllm#46960 (external-hit serving assumes it for MultiConnector
+zero-token allocations).
+---
+ .../test_gdn_prefill_b12x_checkpoint_clone.py | 103 ++++++
+ tests/models/test_glm5next_model_state.py     |  20 +-
+ .../test_mamba_boundary_capture.py            | 345 ++++++++++++++++++
+ .../test_mamba_boundary_capture_digest.py     | 237 ++++++++++++
+ .../offloading_connector/test_scheduler.py    | 115 ++++++
+ .../unit/offloading_connector/test_worker.py  | 228 ++++++++++++
+ tests/v1/kv_offload/cpu/test_manager.py       |  25 ++
+ .../test_qwen4_exp_qsa_resume_fresh_gating.py | 265 ++++++++++++++
+ .../kv_transfer/kv_connector/v1/base.py       |  10 +
+ .../kv_connector/v1/multi_connector.py        |   7 +
+ .../kv_connector/v1/offloading/scheduler.py   |  93 ++++-
+ .../kv_connector/v1/offloading/worker.py      |  14 +-
+ .../kv_connector/v1/offloading_connector.py   |   6 +-
+ vllm/model_executor/layers/mamba/abstract.py  |  25 +-
+ vllm/models/glm5next/model_state.py           |  18 +-
+ vllm/models/qwen4_exp/nvidia/model_state.py   |  49 ++-
+ vllm/v1/core/kv_cache_manager.py              |  14 +
+ vllm/v1/core/sched/scheduler.py               |   6 +
+ vllm/v1/core/single_type_kv_cache_manager.py  | 169 +++++++++
+ vllm/v1/kv_cache_interface.py                 |   7 +
+ vllm/v1/worker/gpu/boundary_checkpoint.py     |   5 +
+ vllm/v1/worker/gpu/model_states/interface.py  |  11 +
+ 22 files changed, 1761 insertions(+), 11 deletions(-)
+ create mode 100644 tests/kernels/mamba/test_gdn_prefill_b12x_checkpoint_clone.py
+ create mode 100644 tests/v1/core/prefix_cache/test_mamba_boundary_capture.py
+ create mode 100644 tests/v1/core/prefix_cache/test_mamba_boundary_capture_digest.py
+ create mode 100644 tests/v1/worker/test_qwen4_exp_qsa_resume_fresh_gating.py
+
+diff --git a/tests/kernels/mamba/test_gdn_prefill_b12x_checkpoint_clone.py b/tests/kernels/mamba/test_gdn_prefill_b12x_checkpoint_clone.py
+new file mode 100644
+index 0000000000..d05b7ff910
+--- /dev/null
++++ b/tests/kernels/mamba/test_gdn_prefill_b12x_checkpoint_clone.py
+@@ -0,0 +1,103 @@
++# SPDX-License-Identifier: Apache-2.0
++# The b12x GDN prefill kernel must clone state at
++# checkpoint_offset == query_len (a step-end boundary crossing) into the
++# designated checkpoint slot, matching the reference oracle. The
++# strictly-interior offset runs as the control.
++import pytest
++import torch
++
++
++def _setup(lengths, offsets, ckpt_slots, max_seqs):
++    from b12x.testing.delta_prefill_cases import PrefillCase, make_inputs
++
++    device = torch.device("cuda")
++    case = PrefillCase("gdn", 2, 6, lengths)
++    max_tokens = sum(lengths)
++    tensors = make_inputs(
++        case, device=device, max_tokens=max_tokens, max_seqs=max_seqs
++    )
++    # Distinct non-final, non-initial checkpoint slots (pool has 3*max_seqs+1).
++    tensors["checkpoint_state_indices"][: len(lengths)] = torch.tensor(
++        ckpt_slots, dtype=torch.int32, device=device
++    )
++    tensors["checkpoint_offsets"][: len(lengths)] = torch.tensor(
++        offsets, dtype=torch.int32, device=device
++    )
++    return case, tensors
++
++
++def _run_case(lengths, offsets, ckpt_slots, max_seqs=2):
++    from b12x.testing.delta_prefill_cases import (
++        assert_close,
++        oracle,
++        prepared_binding,
++        run_binding,
++    )
++
++    case, tensors = _setup(lengths, offsets, ckpt_slots, max_seqs)
++    with prepared_binding(
++        case,
++        tensors,
++        max_tokens=sum(lengths),
++        max_seqs=max_seqs,
++        checkpoint_export=True,
++        null_state_index=0,
++    ) as binding:
++        run_binding("gdn", binding)
++        torch.cuda.synchronize()
++        expected_output, expected_pool = oracle(case, tensors, null_state_index=0)
++        assert_close(
++            "output",
++            binding.output[: sum(lengths)],
++            expected_output[: sum(lengths)],
++            ratio=1e-2,
++        )
++        for slot, offset in zip(ckpt_slots, offsets):
++            assert_close(
++                f"state[{slot}]@offset={offset}",
++                binding.recurrent_state[slot],
++                expected_pool[slot],
++                ratio=5e-3,
++            )
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
++def test_v1_checkpoint_clone_interior_offset():
++    """Control: interior offset (32 < query_len 64) exports state@32."""
++    _run_case(lengths=(64,), offsets=(32,), ckpt_slots=(4,))
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
++def test_v1_checkpoint_clone_at_query_end():
++    """The design's step-end case: offset == query_len (64) must export
++    state@64 into the checkpoint slot (distinct from the final slot)."""
++    _run_case(lengths=(64,), offsets=(64,), ckpt_slots=(4,))
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
++def test_v1_checkpoint_clone_at_query_end_multi_seq():
++    """Step-end clone for every sequence in a packed query."""
++    _run_case(lengths=(64, 48), offsets=(64, 48), ckpt_slots=(4, 5))
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
++def test_v1_checkpoint_clone_offset_exceeds_query_len_no_write():
++    """offset > query_len: reference writes nothing; kernel must leave the
++    slot untouched (design gate never emits this, guard against corruption)."""
++    from b12x.testing.delta_prefill_cases import prepared_binding, run_binding
++
++    case, tensors = _setup((64,), (96,), (4,), max_seqs=2)
++    with prepared_binding(
++        case,
++        tensors,
++        max_tokens=64,
++        max_seqs=2,
++        checkpoint_export=True,
++        null_state_index=0,
++    ) as binding:
++        saved = binding.recurrent_state[4].clone()
++        run_binding("gdn", binding)
++        torch.cuda.synchronize()
++        torch.testing.assert_close(
++            binding.recurrent_state[4], saved, rtol=0, atol=0
++        )
+diff --git a/tests/models/test_glm5next_model_state.py b/tests/models/test_glm5next_model_state.py
+index ae40b1def1..b965d1fd3a 100644
+--- a/tests/models/test_glm5next_model_state.py
++++ b/tests/models/test_glm5next_model_state.py
+@@ -293,7 +293,14 @@ def test_glm5next_recycled_and_rebound_state_is_fresh(monkeypatch) -> None:
+         lambda self: None,
+     )
+ 
+-    state.add_request(5, SimpleNamespace(num_computed_tokens=0))
++    state.add_request(
++        5,
++        SimpleNamespace(
++            num_computed_tokens=0,
++            boundary_checkpoint=None,
++            boundary_checkpoint_blocks=None,
++        ),
++    )
+ 
+     assert state.selector_state_is_fresh_gpu[5]
+     assert state.selector_committed_num_accepted_tokens_gpu[5] == 1
+@@ -330,7 +337,9 @@ def test_glm5next_rejects_unaligned_fresh_prefix(
+         state.add_request(
+             3,
+             SimpleNamespace(
+-                num_computed_tokens=prefix_length, boundary_checkpoint=None
++                num_computed_tokens=prefix_length,
++                boundary_checkpoint=None,
++                boundary_checkpoint_blocks=None,
+             ),
+         )
+ 
+@@ -347,7 +356,12 @@ def test_glm5next_accepts_pool_aligned_fresh_prefix(monkeypatch) -> None:
+     )
+ 
+     state.add_request(
+-        3, SimpleNamespace(num_computed_tokens=4, boundary_checkpoint=None)
++        3,
++        SimpleNamespace(
++            num_computed_tokens=4,
++            boundary_checkpoint=None,
++            boundary_checkpoint_blocks=None,
++        ),
+     )
+ 
+     assert calls == [3]
+diff --git a/tests/v1/core/prefix_cache/test_mamba_boundary_capture.py b/tests/v1/core/prefix_cache/test_mamba_boundary_capture.py
+new file mode 100644
+index 0000000000..6787b91e15
+--- /dev/null
++++ b/tests/v1/core/prefix_cache/test_mamba_boundary_capture.py
+@@ -0,0 +1,345 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Frozen boundary capture for align-mode Mamba + OffloadingConnector.
++
++The connector's boundary store must never source the request's live running
++column: a chunked step's column holds the state at the CHUNK end, and the
++deferred DMA would read it only after the next forward migrated the column
++onward. With capture enabled, each retention crossing the step actually
++computes is copied into a dedicated single-writer pool block before the
++column advances; that block carries the boundary hash and is the sole store
++source, pinned until the store DMA ack.
++
++These tests pin the scheduler-side contract (design invariants I1/I4/I5):
++offers appear only after promotion, the offered id is the capture block and
++never the column, the capture carries the boundary hash, and pins are
++released exactly on store ack / drop / reset.
++"""
++
++import pytest
++import torch
++
++from tests.v1.core.test_prefix_caching import make_kv_cache_manager, make_request
++from vllm.utils.hashing import sha256
++from vllm.v1.core.kv_cache_utils import (
++    KVCacheBlockCopy,
++    init_none_hash,
++    make_block_hash_with_group_id,
++)
++from vllm.v1.kv_cache_interface import (
++    FullAttentionSpec,
++    KVCacheConfig,
++    KVCacheGroupSpec,
++    MambaSpec,
++)
++
++
++@pytest.fixture(autouse=True)
++def _auto_init_hash_fn():
++    init_none_hash(sha256)
++
++
++def _free_ids(manager):
++    return {
++        block.block_id
++        for block in manager.block_pool.free_block_queue.get_all_free_blocks()
++    }
++
++
++def _make_capture_manager(*, boundary_capture: bool, num_blocks: int = 16):
++    """Hybrid manager with mamba block size 4 and dense retention.
++
++    A 4-token chunk ending on the block boundary is the toy analogue of a
++    retention-grid crossing: cache_blocks records it, and only the next
++    schedule pass may promote the capture.
++    """
++    block_size = 4
++    kv_cache_config = KVCacheConfig(
++        num_blocks=num_blocks,
++        kv_cache_tensors=[],
++        kv_cache_groups=[
++            KVCacheGroupSpec(
++                ["full"],
++                FullAttentionSpec(
++                    block_size=block_size,
++                    num_kv_heads=1,
++                    head_size=1,
++                    dtype=torch.float32,
++                ),
++            ),
++            KVCacheGroupSpec(
++                ["mamba"],
++                MambaSpec(
++                    block_size=block_size,
++                    shapes=(1, 1),
++                    dtypes=(torch.float32,),
++                    mamba_cache_mode="align",
++                    boundary_capture=boundary_capture,
++                ),
++            ),
++        ],
++    )
++    manager = make_kv_cache_manager(
++        kv_cache_config=kv_cache_config,
++        max_model_len=8192,
++        enable_caching=True,
++        hash_block_size=block_size,
++    )
++    return manager, block_size
++
++
++def _mamba_manager(manager):
++    return manager.coordinator.single_type_managers[1]
++
++
++def test_capture_offer_names_the_frozen_block_not_the_column():
++    """I1/I4: the (group, block, B) hand-off appears only at promotion, and
++    its block is the dedicated capture -- never the live column the next
++    forward migrates."""
++    manager, block_size = _make_capture_manager(boundary_capture=True)
++    mgr = _mamba_manager(manager)
++
++    req = make_request("p", list(range(8)), block_size, sha256)
++    computed_blocks, num_computed, _ = manager.get_computed_blocks(req)
++    assert manager.allocate_slots(req, 4, num_computed, computed_blocks) is not None
++    column = mgr.req_to_blocks["p"][0]
++
++    # Recorded, not yet offered: the producing step is still the current one.
++    assert "p" in mgr._pending_captures
++    assert manager.take_boundary_state_offloads() == {}
++    assert manager.take_kv_cache_block_copies() == ([], [])
++
++    # Next schedule pass promotes: copy rail + offer, same scheduler output.
++    req.num_computed_tokens = 4
++    manager.new_step_starts()
++
++    ((group_id, capture_id, boundary),) = manager.take_boundary_state_offloads()["p"]
++    assert group_id == 1
++    assert boundary == 4
++    assert capture_id != column.block_id
++
++    copies, retained = manager.take_kv_cache_block_copies()
++    assert copies == [
++        KVCacheBlockCopy(src_block_id=column.block_id, dst_block_id=capture_id)
++    ]
++    assert {b.block_id for b in retained} == {column.block_id, capture_id}
++
++    # The capture itself carries the boundary hash for its group (local hits
++    # past the last live column resume from it too). The live column keeps the
++    # same key until it is re-hashed, so assert on the capture's own fields.
++    block_hash = req.block_hashes[4 // block_size - 1]
++    capture = manager.block_pool.blocks[capture_id]
++    assert capture.block_hash == make_block_hash_with_group_id(block_hash, 1)
++    assert capture.block_hash_num_tokens == 4
++
++    # Pinned (I4) until the store ack: dropping the rail refs leaves exactly
++    # the manager pin; the ack releases the last one.
++    manager.block_pool.free_blocks(retained)
++    assert capture.ref_cnt == 1
++    mgr.release_boundary_capture(capture_id)
++    assert capture.ref_cnt == 0
++    assert capture_id in _free_ids(manager)
++
++    manager.free(req)
++
++
++def test_capture_survives_request_teardown_until_store_ack():
++    """A promoted capture is pool-owned, not request-owned: aborting the
++    producer before the copy step is processed must not release the frozen
++    content or its hash; the store ack does."""
++    manager, block_size = _make_capture_manager(boundary_capture=True)
++    mgr = _mamba_manager(manager)
++
++    req = make_request("r", list(range(8)), block_size, sha256)
++    computed_blocks, num_computed, _ = manager.get_computed_blocks(req)
++    assert manager.allocate_slots(req, 4, num_computed, computed_blocks) is not None
++    column = mgr.req_to_blocks["r"][0]
++    column_id = column.block_id
++
++    req.num_computed_tokens = 4
++    manager.new_step_starts()
++    ((_, capture_id, boundary),) = manager.take_boundary_state_offloads()["r"]
++    assert boundary == 4
++
++    # The request dies before the copy step is processed (abort). The capture
++    # stays pinned: its content is owed to the CPU tier, and it is no longer
++    # reachable through any column.
++    manager.free(req)
++    assert manager.block_pool.blocks[capture_id].ref_cnt >= 1
++    assert manager.block_pool.blocks[capture_id].block_hash is not None
++
++    # Scheduler processed the copy step: rail refs drop; then the store ack.
++    _, retained = manager.take_kv_cache_block_copies()
++    manager.block_pool.free_blocks(retained)
++    assert manager.block_pool.blocks[capture_id].ref_cnt == 1
++    mgr.release_boundary_capture(capture_id)
++    assert capture_id in _free_ids(manager)
++    # The column's rail ref went with the same release path.
++    assert manager.block_pool.blocks[column_id].ref_cnt == 0
++
++
++def test_no_capture_without_enablement_offers_live_column():
++    """The capture path is opt-in: a deployment without boundary_capture
++    keeps the legacy live-column hand-off and enqueues no copy."""
++    manager, block_size = _make_capture_manager(boundary_capture=False)
++    mgr = _mamba_manager(manager)
++
++    req = make_request("x", list(range(8)), block_size, sha256)
++    computed_blocks, num_computed, _ = manager.get_computed_blocks(req)
++    assert manager.allocate_slots(req, 4, num_computed, computed_blocks) is not None
++    column = mgr.req_to_blocks["x"][0]
++
++    ((group_id, block_id, boundary),) = manager.take_boundary_state_offloads()["x"]
++    assert (group_id, block_id, boundary) == (1, column.block_id, 4)
++    assert manager.take_kv_cache_block_copies() == ([], [])
++    assert mgr._pending_captures == {}
++    manager.free(req)
++
++
++def test_release_is_noop_for_unknown_and_non_capture_ids():
++    """The connector may pass fenced ids from any store kind; only capture
++    pins react."""
++    manager, block_size = _make_capture_manager(boundary_capture=True)
++    mgr = _mamba_manager(manager)
++    mgr.release_boundary_capture(12345)  # unknown id: no-op
++
++    req = make_request("n", list(range(8)), block_size, sha256)
++    computed_blocks, num_computed, _ = manager.get_computed_blocks(req)
++    assert manager.allocate_slots(req, 4, num_computed, computed_blocks) is not None
++    column = mgr.req_to_blocks["n"][0]
++    column_id = column.block_id
++
++    req.num_computed_tokens = 4
++    manager.new_step_starts()
++    ((_, capture_id, _),) = manager.take_boundary_state_offloads()["n"]
++    _, retained = manager.take_kv_cache_block_copies()
++    manager.block_pool.free_blocks(retained)
++
++    # A live column id is never in the pin dict: releasing it must not touch
++    # the request's reference.
++    before = manager.block_pool.blocks[column_id].ref_cnt
++    assert before >= 1
++    mgr.release_boundary_capture(column_id)
++    assert manager.block_pool.blocks[column_id].ref_cnt == before
++    mgr.release_boundary_capture(capture_id)
++    assert manager.block_pool.blocks[capture_id].ref_cnt == 0
++    manager.free(req)
++
++
++def test_release_all_drops_pins_and_pending_records():
++    """Cache reset releases every pin and every record-time column ref."""
++    manager, block_size = _make_capture_manager(boundary_capture=True)
++    mgr = _mamba_manager(manager)
++
++    req = make_request("a", list(range(12)), block_size, sha256)
++    computed_blocks, num_computed, _ = manager.get_computed_blocks(req)
++    assert manager.allocate_slots(req, 4, num_computed, computed_blocks) is not None
++    first_column = mgr.req_to_blocks["a"][0]
++
++    req.num_computed_tokens = 4
++    manager.new_step_starts()
++    ((_, capture_id, _),) = manager.take_boundary_state_offloads()["a"]
++    _, retained = manager.take_kv_cache_block_copies()
++    manager.block_pool.free_blocks(retained)
++    assert manager.block_pool.blocks[capture_id].ref_cnt == 1
++
++    # Second chunk [4,8): records a new crossing that is never promoted.
++    assert manager.allocate_slots(req, 4) is not None
++    assert "a" in mgr._pending_captures
++    second_column = mgr.req_to_blocks["a"][1]
++    assert second_column.ref_cnt >= 2  # table + record-time ref
++
++    mgr.release_all_boundary_captures()
++    assert mgr._capture_pinned == {}
++    assert mgr._pending_captures == {}
++    assert manager.block_pool.blocks[capture_id].ref_cnt == 0
++    # The record-time ref on the second column went with the dropped record.
++    assert second_column.ref_cnt == 1
++    manager.free(req)
++    assert first_column.block_id in _free_ids(manager)
++
++
++def test_crossing_capture_keyed_identically_across_diverging_prompts():
++    """Key-level identity: two prompts sharing the prefix through B=4
++    diverge after it; each crossing capture is registered under the SAME
++    boundary key (the chain hash at 4), so a consumer of the store for one
++    prompt resumes the other. The captures are distinct blocks -- content
++    is copied independently of either live column."""
++    manager, block_size = _make_capture_manager(boundary_capture=True)
++    mgr = _mamba_manager(manager)
++
++    capture_ids = []
++    for name, tail in (("p1", 8), ("p2", 9)):
++        req = make_request(name, [0, 1, 2, 3, tail, tail + 1], block_size, sha256)
++        # Both must PRODUCE a capture at 4: without the skip the second
++        # prompt would simply resume from the first prompt's frozen block.
++        req.skip_reading_prefix_cache = name == "p2"
++        computed_blocks, num_computed, _ = manager.get_computed_blocks(req)
++        assert manager.allocate_slots(req, 4, num_computed, computed_blocks) is not None
++        req.num_computed_tokens = 4
++        manager.new_step_starts()
++        ((_, capture_id, boundary),) = manager.take_boundary_state_offloads()[name]
++        assert boundary == 4
++        capture_ids.append(capture_id)
++        _, retained = manager.take_kv_cache_block_copies()
++        manager.block_pool.free_blocks(retained)
++
++    first, second = capture_ids
++    assert first != second  # dedicated block per producer, never shared
++    # Both prompts hashed the same chain at 4 tokens (shared prefix).
++    key = req.block_hashes[4 // block_size - 1]
++    keyed = make_block_hash_with_group_id(key, 1)
++    assert manager.block_pool.blocks[first].block_hash == keyed
++    assert manager.block_pool.blocks[second].block_hash == keyed
++    # Both pins drop only on the store acks.
++    mgr.release_boundary_capture(first)
++    mgr.release_boundary_capture(second)
++    assert manager.block_pool.blocks[first].ref_cnt == 0
++    assert manager.block_pool.blocks[second].ref_cnt == 0
++
++
++def test_late_record_after_load_credit_is_withheld():
++    """Patch A: a crossing whose producing step already completed must not
++    be recorded. When cache_blocks only catches up to the boundary after the
++    optimistic mirror already sits at it (delayed connector-load credit, the
++    probe-#4 late-record class: nct==bnd at record, delta=prompt_final-bnd at
++    drain), promotion would copy a column a later forward already advanced
++    past the boundary -- state@prompt_final keyed at the boundary, the
++    original mislabel defect. The boundary simply keeps no capture and hits
++    fall back to recompute."""
++    manager, block_size = _make_capture_manager(boundary_capture=True)
++    mgr = _mamba_manager(manager)
++
++    req = make_request("d", list(range(8)), block_size, sha256)
++    computed_blocks, num_computed, _ = manager.get_computed_blocks(req)
++    # The producing step runs with caching delayed (connector-load shape).
++    assert (
++        manager.allocate_slots(
++            req, 4, num_computed, computed_blocks, delay_cache_blocks=True
++        )
++        is not None
++    )
++    assert mgr._pending_captures == {}
++
++    # Mirror advances to the boundary; a later pass catches cache_blocks up.
++    req.num_computed_tokens = 4
++    manager.coordinator.cache_blocks(req, 4)
++    assert mgr._pending_captures == {}, "late catch-up must not record"
++
++    manager.new_step_starts()
++    assert manager.take_boundary_state_offloads() == {}
++    manager.free(req)
++
++
++def test_in_step_record_still_captured():
++    """Control for the gate: the step being dispatched now still has the
++    boundary ahead of it (nct < boundary) -- the record proceeds and the
++    next pass promotes exactly as before."""
++    manager, block_size = _make_capture_manager(boundary_capture=True)
++    mgr = _mamba_manager(manager)
++
++    req = make_request("c", list(range(8)), block_size, sha256)
++    computed_blocks, num_computed, _ = manager.get_computed_blocks(req)
++    assert manager.allocate_slots(req, 4, num_computed, computed_blocks) is not None
++    assert "c" in mgr._pending_captures
++    manager.free(req)
+diff --git a/tests/v1/core/prefix_cache/test_mamba_boundary_capture_digest.py b/tests/v1/core/prefix_cache/test_mamba_boundary_capture_digest.py
+new file mode 100644
+index 0000000000..cd9b3e6d37
+--- /dev/null
++++ b/tests/v1/core/prefix_cache/test_mamba_boundary_capture_digest.py
+@@ -0,0 +1,237 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Crossing capture digest identity.
++
++Two prompts sharing the prefix through boundary B, differing after it, each
++run through the real scheduler-side capture pipeline (record -> promote ->
++copy rail) against simulated GPU state tensors. The frozen capture block's
++bytes at B MUST be identical across the two prompts (deterministic
++recurrence over the shared prefix) and MUST differ from each prompt's
++chunk-end column bytes after the next step migrates the column onward --
++the exact value a live-column store would mislabel as state@B. Without
++boundary capture the hand-off names the live column, so the store-time
++digest is the post-migration value: this test pins the defect.
++"""
++
++import hashlib
++
++import pytest
++import torch
++
++from tests.v1.core.test_prefix_caching import make_kv_cache_manager, make_request
++from vllm.utils.hashing import sha256
++from vllm.v1.core.kv_cache_utils import init_none_hash
++from vllm.v1.kv_cache_interface import (
++    FullAttentionSpec,
++    KVCacheConfig,
++    KVCacheGroupSpec,
++    MambaSpec,
++)
++from vllm.v1.worker.utils import copy_kv_cache_blocks_inplace
++
++
++@pytest.fixture(autouse=True)
++def _auto_init_hash_fn():
++    init_none_hash(sha256)
++
++
++BLOCK_SIZE = 4
++NUM_BLOCKS = 16
++PAGE_BYTES = 32
++
++
++def _make_capture_manager(boundary_capture: bool):
++    kv_cache_config = KVCacheConfig(
++        num_blocks=NUM_BLOCKS,
++        kv_cache_tensors=[],
++        kv_cache_groups=[
++            KVCacheGroupSpec(
++                ["full"],
++                FullAttentionSpec(
++                    block_size=BLOCK_SIZE,
++                    num_kv_heads=1,
++                    head_size=1,
++                    dtype=torch.float32,
++                ),
++            ),
++            KVCacheGroupSpec(
++                ["mamba"],
++                MambaSpec(
++                    block_size=BLOCK_SIZE,
++                    shapes=(1, 1),
++                    dtypes=(torch.float32,),
++                    mamba_cache_mode="align",
++                    boundary_capture=boundary_capture,
++                ),
++            ),
++        ],
++    )
++    manager = make_kv_cache_manager(
++        kv_cache_config=kv_cache_config,
++        max_model_len=8192,
++        enable_caching=True,
++        hash_block_size=BLOCK_SIZE,
++    )
++    # Two fake "layers" of per-block state: row index == pool block id.
++    kv_caches = [
++        torch.zeros(NUM_BLOCKS, PAGE_BYTES, dtype=torch.uint8)
++        for _ in range(2)
++    ]
++    return manager, kv_caches
++
++
++def _write_state(kv_caches, block_id, pattern: bytes) -> None:
++    for cache in kv_caches:
++        cache[block_id] = torch.frombuffer(
++            bytearray(pattern * (PAGE_BYTES // len(pattern))),
++            dtype=torch.uint8,
++        ).reshape(PAGE_BYTES)
++
++
++def _digest(kv_caches, block_id) -> str:
++    h = hashlib.sha256()
++    for cache in kv_caches:
++        h.update(cache[block_id].numpy().tobytes())
++    return h.hexdigest()
++
++
++def _produce(manager, kv_caches, name, token_ids, state_at_b: bytes):
++    """Run one producer prompt through record -> promote -> copy rail,
++    simulating the worker: the producer's forward writes state@B into the
++    live column, the rail copies it, then the NEXT step's forward migrates
++    (clobbers) the column with the chunk-end state past B."""
++    mgr = manager.coordinator.single_type_managers[1]
++    req = make_request(name, token_ids, BLOCK_SIZE, sha256)
++    req.skip_reading_prefix_cache = True  # always produce, never resume
++    computed_blocks, num_computed, _ = manager.get_computed_blocks(req)
++    assert manager.allocate_slots(req, 4, num_computed, computed_blocks) is not None
++    column = mgr.req_to_blocks[name][0]
++
++    # Producer forward: column holds state@B exactly (chunk ends at B).
++    _write_state(kv_caches, column.block_id, state_at_b)
++
++    req.num_computed_tokens = 4
++    manager.new_step_starts()  # promote: rail + offer
++    ((group_id, offered_id, boundary),) = manager.take_boundary_state_offloads()[name]
++    assert group_id == 1 and boundary == 4
++    copies, retained = manager.take_kv_cache_block_copies()
++    assert copies and offered_id == copies[0].dst_block_id
++
++    # Worker applies the rail copy (before the next precopy/forward).
++    copy_kv_cache_blocks_inplace(kv_caches, NUM_BLOCKS, copies)
++    capture_digest = _digest(kv_caches, offered_id)
++
++    # Next step's forward migrates the column: state@B is gone from it.
++    _write_state(kv_caches, column.block_id, b"\xee\xff")
++    column_digest_after = _digest(kv_caches, column.block_id)
++
++    manager.block_pool.free_blocks(retained)
++    return offered_id, capture_digest, column_digest_after
++
++
++def test_capture_digest_identical_across_prompts_and_not_the_column():
++    """The mislabel test: frozen captures at B agree across prompts and
++    differ from each prompt's post-migration column bytes."""
++    manager, kv_caches = _make_capture_manager(boundary_capture=True)
++    # Deterministic function of the shared 4-token prefix -> same bytes.
++    state_at_b = b"\x0a\x14\x1e\x28"
++
++    id1, cap1, col1 = _produce(manager, kv_caches, "p1", [0, 1, 2, 3, 8, 9], state_at_b)
++    id2, cap2, col2 = _produce(
++        manager, kv_caches, "p2", [0, 1, 2, 3, 100, 101], state_at_b
++    )
++
++    assert id1 != id2  # dedicated block per producer
++    assert cap1 == cap2  # same prefix -> same state@B (key-identity holds)
++    # Neither capture equals either prompt's chunk-end column value after
++    # migration -- the pre-capture store would have shipped exactly those.
++    assert cap1 != col1
++    assert cap2 != col2
++    assert col1 == col2  # both columns clobbered identically past B
++    # The capture survived the column clobber: bytes are still state@B.
++    assert _digest(kv_caches, id1) == cap1
++    assert _digest(kv_caches, id2) == cap2
++
++
++def test_legacy_live_column_store_mislabels_after_migration():
++    """Without capture the hand-off names the live column: at store time the
++    deferred DMA would read the post-migration value under the state@B key.
++    This pins the defect the capture path removes (pre-change behavior)."""
++    manager, kv_caches = _make_capture_manager(boundary_capture=False)
++    mgr = manager.coordinator.single_type_managers[1]
++
++    req = make_request("x", [0, 1, 2, 3, 8, 9], BLOCK_SIZE, sha256)
++    computed_blocks, num_computed, _ = manager.get_computed_blocks(req)
++    assert manager.allocate_slots(req, 4, num_computed, computed_blocks) is not None
++    column = mgr.req_to_blocks["x"][0]
++    _write_state(kv_caches, column.block_id, b"\x0a\x14\x1e\x28")
++
++    ((group_id, offered_id, boundary),) = manager.take_boundary_state_offloads()["x"]
++    assert (group_id, offered_id, boundary) == (1, column.block_id, 4)
++    # No copy rail on the legacy path.
++    assert manager.take_kv_cache_block_copies() == ([], [])
++
++    state_at_b_digest = _digest(kv_caches, offered_id)
++    # The next forward migrates the column before the deferred DMA reads it.
++    _write_state(kv_caches, column.block_id, b"\xee\xff")
++    assert _digest(kv_caches, offered_id) != state_at_b_digest
++
++
++def test_all_recurrent_groups_of_align_config_carry_capture():
++    """Enablement completeness: every MambaSpec that reaches the kv-cache
++    config of an align-mode + OffloadingConnector deployment carries
++    boundary_capture=True, so no recurrent group's manager falls back to the
++    legacy live-column offer path under a boundary-colliding key.
++
++    Guards the single-site enablement (MambaBase.get_kv_cache_spec): a future
++    spec-construction site or a get_kv_cache_spec override that rebuilds the
++    spec without super() would silently split capture coverage across groups.
++    """
++    from types import SimpleNamespace
++
++    from vllm.config.cache import CacheConfig
++    from vllm.model_executor.layers.mamba.abstract import MambaBase
++
++    class _Layer(MambaBase):
++        def get_state_shape(self):
++            return ((1, 8), (1, 8, 4))
++
++        mamba_type = property(lambda self: None)
++
++        def get_state_dtype(self):
++            return (torch.float32, torch.float32)
++
++    def _spec_for(connector, offload_size, align, boundary_ckpt=False):
++        vllm_config = SimpleNamespace(
++            cache_config=SimpleNamespace(
++                mamba_block_size=64,
++                mamba_page_size_padded=None,
++                mamba_cache_mode=align,
++                use_kda_recoverssm=False,
++                kv_offloading_size=offload_size,
++            ),
++            kv_transfer_config=connector,
++            num_speculative_tokens=0,
++            use_request_boundary_checkpoints=boundary_ckpt,
++        )
++        return _Layer().get_kv_cache_spec(vllm_config)
++
++    connector = SimpleNamespace(
++        has_connector=lambda name: name == "OffloadingConnector"
++    )
++    # Align + complex offloading connector: capture on.
++    for mode in ("align",):
++        spec = _spec_for(connector, 1.0, mode)
++        assert spec.boundary_capture is True, f"{mode} group missed capture"
++    # Any gate missing -> capture off: boundary stores keep the live-column
++    # behavior and external hits stop at the last checkpoint.
++    assert _spec_for(connector, None, "align").boundary_capture is False
++    assert _spec_for(None, 1.0, "align").boundary_capture is False
++    assert _spec_for(
++        SimpleNamespace(has_connector=lambda name: False), 1.0, "align"
++    ).boundary_capture is False
++    assert _spec_for(connector, 1.0, "all").boundary_capture is False
++    assert (
++        _spec_for(connector, 1.0, "align", boundary_ckpt=True).boundary_capture
++        is False
++    )
+diff --git a/tests/v1/kv_connector/unit/offloading_connector/test_scheduler.py b/tests/v1/kv_connector/unit/offloading_connector/test_scheduler.py
+index a368673660..882d76b4d8 100644
+--- a/tests/v1/kv_connector/unit/offloading_connector/test_scheduler.py
++++ b/tests/v1/kv_connector/unit/offloading_connector/test_scheduler.py
+@@ -4777,3 +4777,118 @@ class TestMambaHybridOffloadServing:
+             False,
+         ]
+         assert self._roundtrip_served_tokens(scheduler) == 16
++
++
++def _make_capture_hybrid_scheduler():
++    """OffloadingConnector scheduler over an align-Mamba hybrid whose mamba
++    group declares frozen boundary capture (the serve gate opens)."""
++    from dataclasses import replace
++
++    vllm_config = _make_vllm_config()
++    vllm_config.speculative_config = None
++    kv_cache_config = _make_mamba_hybrid_kv_cache_config()
++    kv_cache_config = replace(
++        kv_cache_config,
++        kv_cache_groups=[
++            kv_cache_config.kv_cache_groups[0],
++            KVCacheGroupSpec(
++                ["mamba_layer"],
++                replace(
++                    kv_cache_config.kv_cache_groups[1].kv_cache_spec,
++                    boundary_capture=True,
++                ),
++            ),
++        ],
++    )
++    spec = MockOffloadingSpec(build_offloading_config(vllm_config, kv_cache_config))
++    return OffloadingConnectorScheduler(spec, vllm_config, kv_cache_config)
++
++
++def test_external_hit_served_when_capture_enabled():
++    """An align-Mamba deployment whose groups declare frozen boundary capture
++    extends external hits to the deepest boundary every group keys, instead of
++    zeroing them."""
++    scheduler = _make_capture_hybrid_scheduler()
++
++    request = _make_partial_tail_request(scheduler)
++    scheduler.manager.lookup.return_value = LookupResult.HIT
++    tokens, load_async = scheduler.get_num_new_matched_tokens(request, 0)
++    assert tokens > 0 and load_async
++
++
++def test_hit_gate_extends_to_keyed_boundary():
++    """With capture enabled the hit ends at the deepest boundary every group
++    keys. The mamba group participates with a one-chunk window over its
++    boundary key: with only its first chunk stored, the hit stops at one
++    chunk -- it is neither zeroed nor extended past the stored key.
++    """
++    scheduler = _make_capture_hybrid_scheduler()
++    request = _make_partial_tail_request(scheduler)
++    req_status = scheduler._req_status["req"]
++    req_status.num_locally_computed_tokens = 0
++    req_status.update_offload_keys()
++
++    # Store only chunk 0 of every group (attention keys h0, mamba state key
++    # at the first chunk end).
++    stored = {state.offload_keys[0] for state in req_status.group_states}
++
++    def _lookup(key, req_context):
++        return LookupResult.HIT if key in stored else LookupResult.MISS
++
++    scheduler.manager.lookup.side_effect = _lookup
++    tokens, load_async = scheduler.get_num_new_matched_tokens(request, 0)
++    assert tokens == 16 and load_async  # one chunk of 16 tokens, not 0
++
++
++def test_capture_pin_released_on_store_ack_and_on_drop():
++    """The connector releases the manager pin on the capture block when the
++    store job completes, and on every offer-skip path (unknown request,
++    save-window filter, dedup)."""
++    scheduler = _make_capture_hybrid_scheduler()
++    released: list[int] = []
++    scheduler.bind_boundary_capture_releaser(released.append)
++    _make_partial_tail_request(scheduler)
++    scheduler.manager.prepare_store.side_effect = lambda keys, req_context: (
++        generate_store_output(keys)
++    )
++
++    # Boundary beyond the save window is filtered -> pin dropped immediately.
++    jobs = scheduler._build_aligned_boundary_store_jobs({"req": [(1, 77, 10 ** 6)]})
++    assert jobs == {}
++    assert released == [77]
++
++    # Accepted offer -> job created; the ack releases the pin.
++    jobs = scheduler._build_aligned_boundary_store_jobs({"req": [(1, 88, 16)]})
++    [job_id] = jobs
++    assert released == [77]  # not before the workers report completion
++    output = KVConnectorOutput(
++        kv_connector_worker_meta=OffloadingWorkerMetadata(
++            completed_jobs={job_id: scheduler.config.num_workers}
++        )
++    )
++    req_status = scheduler._req_status["req"]
++    req_status.finished_signaled = True  # keep _req_status alive for the ack
++    scheduler.update_connector_output(output)
++    assert released == [77, 88]
++
++    # Unknown request drains its offers too.
++    jobs = scheduler._build_aligned_boundary_store_jobs({"ghost": [(1, 99, 16)]})
++    assert jobs == {}
++    assert released == [77, 88, 99]
++
++
++def test_capture_offer_skips_stores_release_pins():
++    """prepare_store allocation failure and dedup (key already stored) both
++    drop the pin: no job will ever read the capture block."""
++    scheduler = _make_capture_hybrid_scheduler()
++    released: list[int] = []
++    scheduler.bind_boundary_capture_releaser(released.append)
++    _make_partial_tail_request(scheduler)
++
++    scheduler.manager.prepare_store.return_value = None
++    assert scheduler._build_aligned_boundary_store_jobs({"req": [(1, 42, 16)]}) == {}
++    assert released == [42]
++
++    scheduler.manager.prepare_store.return_value = generate_store_output([])
++    assert scheduler._build_aligned_boundary_store_jobs({"req": [(1, 43, 16)]}) == {}
++    assert released == [42, 43]
+diff --git a/tests/v1/kv_connector/unit/offloading_connector/test_worker.py b/tests/v1/kv_connector/unit/offloading_connector/test_worker.py
+index 366624e1d3..656408e302 100644
+--- a/tests/v1/kv_connector/unit/offloading_connector/test_worker.py
++++ b/tests/v1/kv_connector/unit/offloading_connector/test_worker.py
+@@ -636,3 +636,231 @@ def test_register_kv_caches_uniform_type(backend):
+     # opaque mapping rather than a certified, parallelism-agnostic one
+     assert group_refs[0].mapping.parallelism_agnostic
+     assert not group_refs[1].mapping.parallelism_agnostic
++
++
++@pytest.mark.parametrize("backend", ATTN_BACKENDS)
++def test_register_kv_caches_padded_attention_ref_carries_full_row(backend):
++    """The narrow-branch refs must transport the FULL padded row for
++    attention pages whose spec carries a padded tail.
++
++    The QSA compressed-K tail lives in [unpadded, padded) of every padded
++    attention page and the consumer reads it through
++    compressed_block_table, so a ref sized to the unpadded page never
++    transports it.
++
++    Also pins the non-regression half: an attention spec WITHOUT a padded
++    tail keeps the identical ref width (page == unpadded), and the CPU
++    tensor row of the padded group is the padded page (the store/load DMA
++    sizes now match it).
++    """
++    from vllm.v1.worker.utils import AttentionGroup
++
++    backend_cls = AttentionBackendEnum[backend].get_class()
++
++    TAIL_BYTES = 4096
++    plain_layer = "model.layers.0.self_attn"
++    padded_layer = "model.layers.1.self_attn"
++    plain_spec = FullAttentionSpec(
++        block_size=BLOCK_SIZE,
++        num_kv_heads=NUM_KV_HEADS,
++        head_size=HEAD_SIZE,
++        dtype=DTYPE,
++    )
++    padded_spec = FullAttentionSpec(
++        block_size=BLOCK_SIZE,
++        num_kv_heads=NUM_KV_HEADS,
++        head_size=HEAD_SIZE,
++        dtype=DTYPE,
++        page_size_padded=plain_spec.page_size_bytes + TAIL_BYTES,
++    )
++    assert padded_spec.unpadded_page_size_bytes == plain_spec.page_size_bytes
++    assert padded_spec.page_size_bytes == plain_spec.page_size_bytes + TAIL_BYTES
++
++    # Two independent groups, each with its own dense per-block run over
++    # one shared backing allocation (the model runner's convention).
++    window = plain_spec.page_size_bytes + padded_spec.page_size_bytes
++    kv_cache_config = KVCacheConfig(
++        num_blocks=NUM_BLOCKS,
++        kv_cache_tensors=[
++            KVCacheTensor(
++                size=window * NUM_BLOCKS,
++                layers=[plain_layer],
++                layer_stride=plain_spec.page_size_bytes * NUM_BLOCKS,
++                block_stride=plain_spec.page_size_bytes,
++            ),
++            KVCacheTensor(
++                size=window * NUM_BLOCKS,
++                layers=[padded_layer],
++                layer_stride=padded_spec.page_size_bytes * NUM_BLOCKS,
++                block_stride=padded_spec.page_size_bytes,
++                offset=plain_spec.page_size_bytes * NUM_BLOCKS,
++            ),
++        ],
++        kv_cache_groups=[
++            KVCacheGroupSpec(
++                layer_names=[plain_layer], kv_cache_spec=plain_spec
++            ),
++            KVCacheGroupSpec(
++                layer_names=[padded_layer], kv_cache_spec=padded_spec
++            ),
++        ],
++    )
++    attn_groups = [
++        [
++            AttentionGroup(
++                backend=backend_cls,
++                layer_names=[plain_layer],
++                kv_cache_spec=plain_spec,
++                kv_cache_group_id=0,
++            ),
++        ],
++        [
++            AttentionGroup(
++                backend=backend_cls,
++                layer_names=[padded_layer],
++                kv_cache_spec=padded_spec,
++                kv_cache_group_id=1,
++            ),
++        ],
++    ]
++    kv_caches = _allocate_kv_caches(
++        kv_cache_config,
++        attn_groups,
++        device=torch.device(f"{DEVICE_TYPE}:0"),
++    )
++
++    worker, spec = _make_worker(kv_cache_config)
++    worker.register_kv_caches(kv_caches)
++
++    canonical = spec.get_worker.call_args[0][0]
++    assert isinstance(canonical, CanonicalKVCaches)
++
++    plain_refs = canonical.group_data_refs[0]
++    padded_refs = canonical.group_data_refs[1]
++    # Non-regression: no padded tail -> ref width unchanged (== page ==
++    # unpadded).
++    for ref in plain_refs:
++        assert ref.page_size_bytes == plain_spec.page_size_bytes
++    # The fix: the padded group's ref transports the whole row.
++    for ref in padded_refs:
++        assert ref.page_size_bytes == padded_spec.page_size_bytes
++        # The mapping still certifies the UNPADDED content width, so the
++        # [unpadded, padded) tail stays distinguishable from the payload.
++        assert ref.mapping is not None
++        assert ref.mapping.local_page_size_bytes == (
++            padded_spec.unpadded_page_size_bytes
++        )
++    # The block tensor row is the padded page on both sides.
++    for block_tensor in canonical.tensors:
++        assert block_tensor.tensor.shape[1] in (
++            plain_spec.page_size_bytes,
++            padded_spec.page_size_bytes,
++        )
++
++
++@pytest.mark.skipif(
++    DEVICE_TYPE != "cuda", reason="Real GPU DMA + pinned CPU tier required"
++)
++def test_padded_attention_tail_survives_store_load_roundtrip():
++    """End-to-end: the compressed-K tail bytes land in the CPU tier on
++    store and come back on load.
++
++    Drives the REAL register_kv_caches path (so the narrow refs are what
++    the worker transports) through a real CPUOffloadingWorker: fill the
++    padded GPU row with distinct bytes, store, wipe the GPU row, load
++    back, and require the FULL row -- [unpadded, padded) tail included
++    -- to match."""
++    from vllm.v1.worker.utils import AttentionGroup
++    from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
++    from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
++
++    backend_cls = AttentionBackendEnum["FLASH_ATTN"].get_class()
++
++    TAIL_BYTES = 4096
++    layer = "model.layers.0.self_attn"
++    spec = FullAttentionSpec(
++        block_size=BLOCK_SIZE,
++        num_kv_heads=NUM_KV_HEADS,
++        head_size=HEAD_SIZE,
++        dtype=DTYPE,
++        page_size_padded=(
++            2 * BLOCK_SIZE * NUM_KV_HEADS * HEAD_SIZE * get_dtype_size(DTYPE)
++            + TAIL_BYTES
++        ),
++    )
++    unpadded = spec.unpadded_page_size_bytes
++    padded = spec.page_size_bytes
++    assert padded - unpadded == TAIL_BYTES
++
++    kv_cache_config = KVCacheConfig(
++        num_blocks=NUM_BLOCKS,
++        kv_cache_tensors=[
++            KVCacheTensor(
++                size=padded * NUM_BLOCKS,
++                layers=[layer],
++                layer_stride=padded * NUM_BLOCKS,
++                block_stride=padded,
++            ),
++        ],
++        kv_cache_groups=[
++            KVCacheGroupSpec(layer_names=[layer], kv_cache_spec=spec)
++        ],
++    )
++    attn_groups = [
++        [
++            AttentionGroup(
++                backend=backend_cls,
++                layer_names=[layer],
++                kv_cache_spec=spec,
++                kv_cache_group_id=0,
++            ),
++        ]
++    ]
++    kv_caches = _allocate_kv_caches(
++        kv_cache_config, attn_groups, device=torch.device("cuda:0")
++    )
++
++    worker, spec_mock = _make_worker(kv_cache_config)
++    worker.register_kv_caches(kv_caches)
++    canonical = spec_mock.get_worker.call_args[0][0]
++    # The transport width the roundtrip below must observe.
++    assert canonical.group_data_refs[0][0].page_size_bytes == padded
++
++    offload_worker = CPUOffloadingWorker(
++        kv_caches=canonical,
++        blocks_per_chunk=1,
++        num_cpu_chunks=4,
++    )
++    try:
++        gpu_row = canonical.tensors[0].tensor[3]  # GPU block 3
++        # Distinct, position-dependent bytes so a zero tail is detectable.
++        pattern = (
++            torch.arange(padded, dtype=torch.int64) % 251
++        ).to(torch.int8)
++        gpu_row.copy_(pattern.to(gpu_row.device))
++
++        assert offload_worker.submit_store(
++            1,
++            GPULoadStoreSpec([3], group_sizes=(1,), block_indices=(0,)),
++            CPULoadStoreSpec([1]),
++        )
++        offload_worker.wait({1})
++
++        # Wipe the GPU row; only the CPU tier can bring the tail back.
++        gpu_row.zero_()
++        torch.cuda.synchronize()
++
++        assert offload_worker.submit_load(
++            2,
++            CPULoadStoreSpec([1]),
++            GPULoadStoreSpec([3], group_sizes=(1,), block_indices=(0,)),
++        )
++        offload_worker.wait({2})
++
++        reloaded = gpu_row.cpu()
++        # Regression guard: [unpadded, padded) must leave the GPU on store.
++        tail = reloaded[unpadded:padded]
++        assert tail.abs().sum().item() != 0, "tail bytes were never transported"
++        torch.testing.assert_close(reloaded, pattern.cpu())
++    finally:
++        offload_worker.shutdown()
+diff --git a/tests/v1/kv_offload/cpu/test_manager.py b/tests/v1/kv_offload/cpu/test_manager.py
+index a79f480ff5..1a783e59b4 100644
+--- a/tests/v1/kv_offload/cpu/test_manager.py
++++ b/tests/v1/kv_offload/cpu/test_manager.py
+@@ -1156,3 +1156,28 @@ def test_touch_forwards_req_context_to_policy(monkeypatch):
+     assert len(received) == 1
+     assert received[0][0] == keys
+     assert received[0][1] is ctx
++
++
++def test_second_store_of_in_flight_key_is_deduped():
++    """A key registered by prepare_store but not yet completed must dedup a
++    second store of the same key: the in-flight chunk is already claimed, so
++    a concurrent producer (two requests sharing a boundary prefix) must not
++    allocate a second chunk or overwrite the pending one. This is the
++    first-writer-wins guarantee the boundary-store path relies on for
++    same-key producers."""
++    manager = make_cpu_manager(num_chunks=4)
++
++    out1 = manager.prepare_store(to_keys([7]), _EMPTY_REQ_CTX)
++    assert out1 is not None and out1.keys_to_store == to_keys([7])
++
++    # Same key offered again while the first store is still in flight.
++    out2 = manager.prepare_store(to_keys([7]), _EMPTY_REQ_CTX)
++    assert out2 is not None
++    assert out2.keys_to_store == [], "in-flight key must dedup, not overwrite"
++    assert manager.lookup(to_key(7), _EMPTY_REQ_CTX) is LookupResult.HIT_PENDING
++
++    # The first store completing does not disturb the dedup decision.
++    manager.complete_store(to_keys([7]), _EMPTY_REQ_CTX)
++    assert manager.lookup(to_key(7), _EMPTY_REQ_CTX) is LookupResult.HIT
++    out3 = manager.prepare_store(to_keys([7]), _EMPTY_REQ_CTX)
++    assert out3 is not None and out3.keys_to_store == []
+diff --git a/tests/v1/worker/test_qwen4_exp_qsa_resume_fresh_gating.py b/tests/v1/worker/test_qwen4_exp_qsa_resume_fresh_gating.py
+new file mode 100644
+index 0000000000..911dd6b88b
+--- /dev/null
++++ b/tests/v1/worker/test_qwen4_exp_qsa_resume_fresh_gating.py
+@@ -0,0 +1,265 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""The QSA pool fresh-reset must key on a real selector-pool restore.
++
++The QSA selector pools (raw ring / logical tags / RoPE / anchor) are per-slot
++module buffers, reset when ``qsa_state_is_fresh_gpu`` is set for a slot
++(b12x_qsa.py).  Only the boundary-checkpoint rail restores them: it collects
++``get_recurrent_checkpoint_tensors`` and copies the slot's rows, so it alone
++may clear the flag -- and it does so itself, or the next forward would
++re-zero what it just copied.
++
++A connector external-resume restores KV pages, not these pools.  The ring is
++a bounded speculative-interval window (``raw_ring_capacity`` rows); the
++committed prefix's selector coverage is the compressed-K page tail, which the
++padded connector transport does restore.  So the reset discards no prefix
++state, and it re-derives the anchor as ``first_position - accepted`` =
++``prefix - 1``, the value the checkpoint path seeds by hand.  A resumed
++prefix without a checkpoint therefore keeps the fresh flag, which clears the
++prior slot owner's rows.
++
++Regression shape: ``add_request`` keyed the clear on ``num_computed_tokens >
++0``, so a recycled slot still holding another request's rows was read as if it
++were this request's committed selector state.
++"""
++
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from vllm.models.qwen4_exp.nvidia.model_state import Qwen4ExpModelState
++from vllm.platforms import current_platform
++from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
++
++MAX_REQS = 8
++
++
++def _bare_qsa_state() -> Qwen4ExpModelState:
++    """A Qwen4ExpModelState with only the fields add_request touches."""
++    state = Qwen4ExpModelState.__new__(Qwen4ExpModelState)
++    state.max_num_reqs = MAX_REQS
++    state.uses_qsa = True
++    state.qsa_state_slot_ids = torch.arange(MAX_REQS, dtype=torch.int32)
++    state._qsa_default_slot_ids = state.qsa_state_slot_ids.clone()
++    state.qsa_state_is_fresh = torch.ones(MAX_REQS, dtype=torch.bool)
++    state.qsa_state_is_fresh_gpu = torch.ones(MAX_REQS, dtype=torch.bool)
++    state.qsa_num_accepted_tokens = torch.ones(MAX_REQS, dtype=torch.int32)
++    state.qsa_committed_num_accepted_tokens_gpu = torch.ones(
++        MAX_REQS, dtype=torch.int32
++    )
++    state._qsa_draft_is_prefilling = torch.zeros(MAX_REQS, dtype=torch.bool)
++    state._qsa_draft_is_prefilling_gpu = torch.zeros(MAX_REQS, dtype=torch.bool)
++    return state
++
++
++class _FakeQSALayer:
++    """Minimal stand-in for the QSA attention module surface add_request
++    consumes: the anchor pool + the setter."""
++
++    def __init__(self, max_seqs: int = MAX_REQS):
++        self._raw_interval_start_positions = torch.full(
++            (max_seqs,), -1, dtype=torch.int64
++        )
++
++    def set_recurrent_checkpoint_anchor(self, slot: int, anchor) -> None:
++        self._raw_interval_start_positions[slot] = anchor
++
++
++def _attach_fake_layers(state: Qwen4ExpModelState) -> list[_FakeQSALayer]:
++    layers = [_FakeQSALayer(), _FakeQSALayer()]
++    state.model = SimpleNamespace(
++        modules=lambda: iter(layers),
++    )
++    return layers
++
++
++def _new_req(
++    num_computed_tokens: int,
++    boundary_checkpoint=None,
++    boundary_checkpoint_blocks=None,
++) -> SimpleNamespace:
++    return SimpleNamespace(
++        num_computed_tokens=num_computed_tokens,
++        boundary_checkpoint=boundary_checkpoint,
++        boundary_checkpoint_blocks=boundary_checkpoint_blocks,
++    )
++
++
++def test_cold_add_keeps_fresh_true(monkeypatch: pytest.MonkeyPatch) -> None:
++    """Control: a cold add (no restored prefix) owns a recycled slot."""
++    state = _bare_qsa_state()
++    layers = _attach_fake_layers(state)
++    monkeypatch.setattr(
++        MambaHybridModelState, "add_request", lambda self, i, r: None
++    )
++
++    state.add_request(3, _new_req(0))
++
++    assert bool(state.qsa_state_is_fresh_gpu[3])
++    assert int(state.qsa_committed_num_accepted_tokens_gpu[3]) == 1
++    # No anchor seeding for a cold add.
++    for layer in layers:
++        assert int(layer._raw_interval_start_positions[3]) == -1
++
++
++def test_external_resume_add_keeps_fresh_true(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """A connector external-resume restores KV pages only.  Its slot may be
++    recycled from another request, so the pools must be reset; the reset
++    re-derives the same anchor a checkpoint restore would have seeded."""
++    state = _bare_qsa_state()
++    state.qsa_state_is_fresh_gpu[5].fill_(False)  # prior owner cleared
++    layers = _attach_fake_layers(state)
++    monkeypatch.setattr(
++        MambaHybridModelState, "add_request", lambda self, i, r: None
++    )
++
++    state.add_request(5, _new_req(9024))
++
++    assert bool(state.qsa_state_is_fresh_gpu[5])
++    assert int(state.qsa_committed_num_accepted_tokens_gpu[5]) == 1
++    # No anchor seeding: the fresh reset owns that write.
++    for layer in layers:
++        assert int(layer._raw_interval_start_positions[5]) == -1
++
++
++def test_local_hit_add_keeps_fresh_true(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """A local prefix-cache hit without a checkpoint has the same gap: the
++    producer's raw rows lived in the producer's slot, not in the restored
++    pages, so the resumed slot stays fresh."""
++    state = _bare_qsa_state()
++    _attach_fake_layers(state)
++    monkeypatch.setattr(
++        MambaHybridModelState, "add_request", lambda self, i, r: None
++    )
++
++    state.add_request(0, _new_req(6016))
++
++    assert bool(state.qsa_state_is_fresh_gpu[0])
++
++
++def test_boundary_checkpoint_add_clears_fresh_and_seeds_anchor(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """The one resume with selector-pool continuity: the checkpoint restore
++    writes this slot's pools, so the flag stays clear and the anchor seeds to
++    the checkpoint boundary - 1, the value the skipped fresh-reset would have
++    produced (the rail seeds the same value; this keeps the pre-forward
++    state right on its own)."""
++    state = _bare_qsa_state()
++    state.qsa_state_is_fresh_gpu[5].fill_(True)
++    layers = _attach_fake_layers(state)
++    monkeypatch.setattr(
++        MambaHybridModelState, "add_request", lambda self, i, r: None
++    )
++
++    checkpoint = SimpleNamespace(num_tokens=9024)
++    state.add_request(
++        5,
++        _new_req(
++            9024,
++            boundary_checkpoint=checkpoint,
++            boundary_checkpoint_blocks=((1,),),
++        ),
++    )
++
++    assert not bool(state.qsa_state_is_fresh_gpu[5])
++    assert int(state.qsa_committed_num_accepted_tokens_gpu[5]) == 1
++    for layer in layers:
++        assert int(layer._raw_interval_start_positions[5]) == 9023
++
++
++def test_checkpoint_without_allocation_keeps_fresh_true(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """The rail restores only when both fields are present: without an
++    allocation its add_request returns before the pool copy, so the gate must
++    not clear a flag the restore will not re-clear."""
++    state = _bare_qsa_state()
++    state.qsa_state_is_fresh_gpu[5].fill_(False)
++    _attach_fake_layers(state)
++    monkeypatch.setattr(
++        MambaHybridModelState, "add_request", lambda self, i, r: None
++    )
++
++    state.add_request(
++        5,
++        _new_req(9024, boundary_checkpoint=SimpleNamespace(num_tokens=9024)),
++    )
++
++    assert bool(state.qsa_state_is_fresh_gpu[5])
++
++
++def test_fresh_hook_returns_the_gpu_flag_tensor() -> None:
++    """The boundary-restore path consumes the flag through the interface
++    hook; it must be the live GPU tensor, not a copy."""
++    state = _bare_qsa_state()
++    assert state.get_recurrent_checkpoint_fresh() is state.qsa_state_is_fresh_gpu
++
++
++@pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
++def test_boundary_restore_clears_fresh_flag() -> None:
++    """The restore branch of BoundaryCheckpointState.add_request must clear
++    the fresh flag.  Drives the real method with a stub state carrying only
++    the attributes the restore branch reads."""
++    from vllm.v1.worker.gpu.boundary_checkpoint import BoundaryCheckpointState
++
++    device = torch.device("cuda")
++    slot = 2
++
++    fresh_gpu = torch.ones(MAX_REQS, dtype=torch.bool, device=device)
++    acceptance_gpu = torch.ones(MAX_REQS, dtype=torch.int32, device=device)
++    model_state = SimpleNamespace(
++        get_recurrent_checkpoint_fresh=lambda: fresh_gpu,
++        get_recurrent_checkpoint_acceptance=lambda: acceptance_gpu,
++        model_config=SimpleNamespace(max_model_len=16384),
++    )
++
++    # One auxiliary tensor restored from pool block 1 into the slot row.
++    aux = torch.zeros(MAX_REQS, 8, dtype=torch.uint8, device=device)
++    pool = torch.zeros(4, 64, dtype=torch.uint8, device=device)
++    pool[1, 0:8] = 7
++    aux_metadata = torch.tensor(
++        [[aux.data_ptr(), aux.stride(0) * aux.element_size(), 8, 0]],
++        dtype=torch.int64,
++        device=device,
++    )
++
++    checkpoint = SimpleNamespace(
++        num_tokens=9024,
++        auxiliary_block_ids=(1,),
++    )
++    st = BoundaryCheckpointState.__new__(BoundaryCheckpointState)
++    st.device = device
++    st.model_state = model_state
++    st.seen = torch.zeros(MAX_REQS, 4, dtype=torch.int32, device=device)
++    st.metadata = torch.zeros(MAX_REQS, 7, dtype=torch.int32, device=device)
++    st.blocks = torch.zeros(MAX_REQS, 4, 8, dtype=torch.int32, device=device)
++    st.mamba_blocks = torch.zeros(MAX_REQS, 4, 1, dtype=torch.int32, device=device)
++    st.stop_tokens = torch.zeros(MAX_REQS, 128, dtype=torch.int32, device=device)
++    st.mamba_group_ids = [0]
++    st.auxiliary_metadata = aux_metadata
++    st.pool = pool
++    st.target_modules = []
++
++    st.add_request(
++        slot,
++        SimpleNamespace(
++            boundary_checkpoint_blocks=((1, 0, 0, 0, 0, 0, 0, 0),),
++            sampling_params=SimpleNamespace(
++                max_tokens=64, min_tokens=1, stop_token_ids=[], eos_token_id=None
++            ),
++            prompt_len=9059,
++            recurrent_instruction_boundary=None,
++            recurrent_prefill_tail_boundary=None,
++            boundary_checkpoint=checkpoint,
++        ),
++    )
++
++    assert not bool(fresh_gpu[slot])
++    # The restore still performs its other writes (acceptance reset).
++    assert int(acceptance_gpu[slot]) == 1
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/base.py b/vllm/distributed/kv_transfer/kv_connector/v1/base.py
+index a7b6c2aa14..b5666641a8 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/base.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/base.py
+@@ -477,6 +477,16 @@ class KVConnectorBase_V1(ABC):
+         self._kv_cache_manager = kv_cache_manager
+         self.bind_gpu_block_pool(kv_cache_manager.block_pool)
+ 
++    def bind_boundary_capture_releaser(self, releaser: Callable[[int], None]) -> None:
++        """Bind the cache manager's capture-pin releaser.
++
++        A connector whose boundary stores source frozen capture blocks must
++        release the manager pin when a store job completes or the offer is
++        dropped. Connectors that never source capture blocks ignore it (the
++        manager's pin dict stays empty, so a missed release cannot leak).
++        """
++        return None
++
+     @classmethod
+     def supports_request_boundary_checkpoints(cls, config: "VllmConfig") -> bool:
+         """Whether configuration selects a complete external checkpoint adapter."""
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py
+index d291d38528..606b8322bf 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py
+@@ -261,6 +261,13 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
+         for c in self._connectors:
+             c.bind_gpu_block_pool(gpu_block_pool)
+ 
++    def bind_boundary_capture_releaser(self, releaser: Callable[[int], None]) -> None:
++        # OffloadingConnector as a MultiConnector child still owns capture
++        # pins (enablement checks has_connector, which sees children): every
++        # child gets the releaser; the base no-op absorbs the rest.
++        for c in self._connectors:
++            c.bind_boundary_capture_releaser(releaser)
++
+     # We must override the base class method here because we need to bind
+     # the metadata to each connector in the order of the connectors in the
+     # MultiKVConnectorMetadata.
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+index 521f8b4a15..4ce18152e6 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+@@ -1,7 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import time
+-from collections.abc import Iterable, Sequence
++from collections.abc import Callable, Iterable, Sequence
+ from dataclasses import dataclass, field, replace
+ from itertools import chain, islice
+ from typing import Any, NamedTuple
+@@ -97,7 +97,11 @@ class GroupOffloadConfig(NamedTuple):
+     # Cached manager class for this group's KV cache spec, resolved at init time
+     manager_cls: type[SingleTypeKVCacheManager]
+     # Partial-tail data for this group comes from the scheduler's CoW hand-off
+-    # rather than the request block table.
++    # rather than the request block table. Invariant (asserted in from_spec and
++    # at capture record time): a frozen capture boundary is a state-block
++    # multiple, and partial-tail configs force chunk == block, so the aligned
++    # builder alone owns capture offers and its release-before-DMA branch never
++    # abandons a pinned source to a partial-tail claim.
+     requires_cow_source: bool = False
+     # True for EAGLE/MTP draft-model attention groups. The trailing chunk
+     # of these groups is volatile and lacks a stable hash, so it must
+@@ -314,6 +318,18 @@ class SchedulerOffloadConfig(NamedTuple):
+             and not any(config.is_eagle_group for config in kv_group_configs)
+             and vllm_config.parallel_config.decode_context_parallel_size == 1
+         )
++        # Drift guard for the capture-ownership invariant (see
++        # GroupOffloadConfig.requires_cow_source): capture boundaries are state
++        # -block multiples and the partial-tail builder only claims non-block
++        # multiples, so the aligned builder's release-before-DMA branch can
++        # never strand a pinned capture source to a partial-tail claim.
++        assert not supports_partial_tail or all(
++            config.tokens_per_chunk == config.tokens_per_block
++            for config in kv_group_configs
++        ), (
++            "partial tails require one physical block per offload chunk so "
++            "frozen capture boundaries stay out of the partial-tail builder"
++        )
+ 
+         if retention_interval is not None:
+             if retention_interval < 0:
+@@ -601,6 +617,19 @@ class OffloadingConnectorScheduler:
+             for config in self.config.kv_group_configs
+             if config.requires_cow_source
+         )
++        # Align-mode Mamba boundary stores source FROZEN capture blocks
++        # (single_type_kv_cache_manager boundary capture): a dedicated pool
++        # block written exactly once by a post-forward copy at the step whose
++        # forward ended at the retention boundary B, then fenced like any
++        # other store source. With capture enabled on every recurrent group,
++        # the external hit extends to the largest B where all groups key --
++        # which is exactly what the per-group convergence in
++        # `_lookup_complete_chunks` computes (mamba groups participate with a
++        # one-chunk window over their boundary state key). No half-restore.
++        # Without frozen capture the boundary store still sources the request's
++        # live running column, which the deferred DMA reads after the next
++        # forward clobbers it: align-Mamba deployments must enable
++        # boundary_capture on every recurrent group.
+ 
+         self._req_status: dict[ReqId, RequestOffloadState] = {}
+         self._current_batch_load_jobs: dict[int, TransferJob] = {}
+@@ -618,6 +647,9 @@ class OffloadingConnectorScheduler:
+         # Threshold value for stale jobs. All job ids >= _stale_job_threshold are
+         # active jobs.
+         self._stale_job_threshold: int = 0
++        # job_id -> capture-pinned source blocks of store jobs orphaned by a
++        # cache reset; released when the worker's stale ack drains them (I4).
++        self._stale_capture_blocks: dict[int, list[int]] = {}
+         self._jobs: dict[int, TransferJobStatus] = {}
+ 
+         # block_id -> pending store job_ids. Used to track jobs that needs
+@@ -626,9 +658,20 @@ class OffloadingConnectorScheduler:
+         # protected by their ref_cnt) and for sliding window blocks (which can
+         # be freed before a request finishes).
+         self._block_id_to_pending_jobs: dict[int, set[int]] = {}
++        # Set by the scheduler after the KV cache manager exists: releases the
++        # manager pin on a frozen capture block once its store completed or the
++        # offer was dropped (I4). No-op for block ids the manager never pinned.
++        self._release_boundary_capture: Callable[[int], None] | None = None
+ 
+         self._events_tracker = OffloadingEventsTracker(spec.kv_events_config)
+ 
++    def bind_boundary_capture_releaser(self, releaser: Callable[[int], None]) -> None:
++        self._release_boundary_capture = releaser
++
++    def _release_capture(self, block_id: int) -> None:
++        if self._release_boundary_capture is not None:
++            self._release_boundary_capture(block_id)
++
+     def _maybe_observe_lookup_async_delay(
+         self, req_status: RequestOffloadState
+     ) -> None:
+@@ -1300,12 +1343,17 @@ class OffloadingConnectorScheduler:
+         for req_id, entries in handoffs.items():
+             req_status = self._req_status.get(req_id)
+             if req_status is None:
++                # Offered after the request's last job drained: nothing will
++                # store these blocks, so drop their capture pins now.
++                for _, block_id, _ in entries:
++                    self._release_capture(block_id)
+                 continue
+             req = req_status.req
+             max_boundary = self._calc_num_offloadable_tokens(req_status, req.num_tokens)
+             for group_idx, block_id, boundary in entries:
+                 config_idx = config_idx_by_group.get(group_idx)
+                 if config_idx is None:
++                    self._release_capture(block_id)
+                     continue
+                 group_config = self.config.kv_group_configs[config_idx]
+                 if (
+@@ -1313,6 +1361,7 @@ class OffloadingConnectorScheduler:
+                     or boundary > max_boundary
+                     or boundary % group_config.tokens_per_chunk != 0
+                 ):
++                    self._release_capture(block_id)
+                     continue
+ 
+                 key = self._make_boundary_key(req, group_idx, boundary)
+@@ -1321,8 +1370,12 @@ class OffloadingConnectorScheduler:
+                     self._connector_stats.increase_counter(
+                         _ConnectorMetricName.ALLOCATION_FAILURE
+                     )
++                    self._release_capture(block_id)
+                     continue
+                 if not store_output.keys_to_store:
++                    # Deduped: the CPU tier already holds this key (an
++                    # earlier producer stored it). No DMA is submitted.
++                    self._release_capture(block_id)
+                     continue
+ 
+                 job_id = self._generate_job_id()
+@@ -1408,6 +1461,10 @@ class OffloadingConnectorScheduler:
+                 and block_idx >= len(group_states[group.group_idx].block_ids)
+                 for group in self.config.kv_group_configs
+             ):
++                # Abandoned hand-off: drop capture pins among the CoW sources
++                # (no-op for table blocks), mirroring the aligned builder.
++                for block_id in cow_blocks.values():
++                    self._release_capture(block_id)
+                 continue
+             keys = [
+                 self._make_boundary_key(req, group.group_idx, boundary)
+@@ -1426,8 +1483,14 @@ class OffloadingConnectorScheduler:
+                 self._connector_stats.increase_counter(
+                     _ConnectorMetricName.ALLOCATION_FAILURE
+                 )
++                for block_id in cow_blocks.values():
++                    self._release_capture(block_id)
+                 continue
+             if not store_output.keys_to_store:
++                # Deduped: the CPU tier already holds these keys; no DMA is
++                # submitted, so any capture-sourced CoW pin drops here.
++                for block_id in cow_blocks.values():
++                    self._release_capture(block_id)
+                 continue
+ 
+             for group_config, key in zip(self.config.kv_group_configs, keys):
+@@ -1930,6 +1993,18 @@ class OffloadingConnectorScheduler:
+                     job_id,
+                     self._stale_job_threshold,
+                 )
++                # The release loop below never runs for this orphan: drain its
++                # recorded capture pins, skipping blocks a live (post-reset)
++                # job now fences — block ids are reused across resets.
++                stale_blocks = self._stale_capture_blocks.pop(job_id, ())
++                if stale_blocks:
++                    live_fenced: set[int] = set()
++                    for job in self._jobs.values():
++                        live_fenced.update(job.fenced_block_ids or ())
++                        live_fenced.update(job.deferred_fence_block_ids or ())
++                    for block_id in stale_blocks:
++                        if block_id not in live_fenced:
++                            self._release_capture(block_id)
+                 continue
+             job_status = self._jobs[job_id]
+             job_status.pending_count -= count
+@@ -1940,6 +2015,11 @@ class OffloadingConnectorScheduler:
+             req_status = self._req_status[job_status.req_id]
+             if job_status.is_store:
+                 self.manager.complete_store(job_status.keys, req_status.req_context)
++                # Every worker's D2H read of the source blocks is done (I4):
++                # release the manager pin on any frozen capture sources.
++                # No-op for block ids the manager never pinned.
++                for block_id in job_status.fenced_block_ids or ():
++                    self._release_capture(block_id)
+             else:
+                 self.manager.complete_load(job_status.keys, req_status.req_context)
+                 if self._chunks_being_loaded:
+@@ -2058,6 +2138,15 @@ class OffloadingConnectorScheduler:
+ 
+         # Discard jobs and save job_counter to be able to discard worker responses
+         self._stale_job_threshold = self._job_counter
++        # Stale acks skip the release loop; record orphaned store fences so a
++        # reset that bypassed the manager's release-all can't leak pins (I4).
++        self._stale_capture_blocks.update(
++            {
++                job_id: list(job.fenced_block_ids)
++                for job_id, job in self._jobs.items()
++                if job.is_store and job.fenced_block_ids
++            }
++        )
+         self._jobs.clear()
+         self._block_id_to_pending_jobs.clear()
+ 
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py
+index 14e826e552..8649065f0d 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py
+@@ -21,6 +21,7 @@ from vllm.logger import init_logger
+ from vllm.v1.kv_cache_interface import (
+     AttentionSpec,
+     KVCacheConfig,
++    KVCacheSpec,
+     MambaSpec,
+     UniformTypeKVCacheSpecs,
+     group_kernel_blocks,
+@@ -82,6 +83,8 @@ class OffloadingConnectorWorker:
+         unpadded_page_size_bytes: dict[str, int] = {}
+         # layer_name -> size of page in bytes
+         page_size_bytes: dict[str, int] = {}
++        # layer_name -> KV cache spec of the layer
++        layer_specs: dict[str, KVCacheSpec] = {}
+         for kv_cache_group in selected_groups:
+             assert not kv_cache_group.host_resident
+             num_blocks = kv_cache_config.num_blocks
+@@ -95,6 +98,7 @@ class OffloadingConnectorWorker:
+                 layer_kv_cache_spec = per_layer_specs.get(
+                     layer_name, group_kv_cache_spec
+                 )
++                layer_specs[layer_name] = layer_kv_cache_spec
+                 ref = group_kernel_blocks(kv_caches[layer_name], num_blocks)
+                 page = layer_kv_cache_spec.page_size_bytes
+                 elem_size = ref.element_size()
+@@ -194,7 +198,15 @@ class OffloadingConnectorWorker:
+                     block_data_refs[layer_name].append(
+                         CanonicalKVCacheRef(
+                             tensor_idx=curr_tensor_idx,
+-                            page_size_bytes=(unpadded_page_size_bytes[layer_name]),
++                            # Attention refs transport the FULL padded page:
++                            # the compressed-K tail lives in
++                            # [unpadded, padded) and the consumer reads it.
++                            # Mamba refs keep the unpadded width.
++                            page_size_bytes=(
++                                page_size_bytes[layer_name]
++                                if isinstance(layer_specs[layer_name], AttentionSpec)
++                                else unpadded_page_size_bytes[layer_name]
++                            ),
+                             mapping=mapping,
+                         )
+                     )
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py
+index 7357088175..2eb0f56118 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py
+@@ -1,6 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-from collections.abc import Iterable
++from collections.abc import Callable, Iterable
+ from functools import cached_property
+ from typing import Any
+ 
+@@ -98,6 +98,10 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
+                 spec, vllm_config, kv_cache_config
+             )
+ 
++    def bind_boundary_capture_releaser(self, releaser: "Callable[[int], None]") -> None:
++        if self.connector_scheduler is not None:
++            self.connector_scheduler.bind_boundary_capture_releaser(releaser)
++
+     def shutdown(self) -> None:
+         if self.connector_worker is not None:
+             self.connector_worker.shutdown()
+diff --git a/vllm/model_executor/layers/mamba/abstract.py b/vllm/model_executor/layers/mamba/abstract.py
+index 6e7455a499..33e3802f36 100644
+--- a/vllm/model_executor/layers/mamba/abstract.py
++++ b/vllm/model_executor/layers/mamba/abstract.py
+@@ -72,6 +72,26 @@ class MambaBase(AttentionLayerBase):
+         mamba_block_size = vllm_config.cache_config.mamba_block_size
+         assert mamba_block_size is not None
+         page_size_padded = vllm_config.cache_config.mamba_page_size_padded
++        cache_config = vllm_config.cache_config
++        kv_transfer_config = vllm_config.kv_transfer_config
++        # Frozen boundary capture: the align-mode column-migration defect
++        # (a deferred connector boundary store sourcing a live column the
++        # next forward clobbers) only exists when the complex offloading
++        # connector moves state off-GPU. With it enabled, the manager copies
++        # each retention-grid crossing into a dedicated single-writer pool
++        # block before the column advances, and that block -- never the
++        # column -- is the store source. The copy rail is backend-agnostic
++        # (post-forward D2D of the whole page), so no scan rework is needed.
++        boundary_capture = (
++            cache_config.mamba_cache_mode == "align"
++            and cache_config.kv_offloading_size is not None
++            and kv_transfer_config is not None
++            and kv_transfer_config.has_connector("OffloadingConnector")
++            # Atomic request-boundary checkpoints own the same columns with
++            # their own capture path; the two features are mutually exclusive
++            # (kv_offloading_size already asserts it) -- never double-capture.
++            and not vllm_config.use_request_boundary_checkpoints
++        )
+         return MambaSpec(
+             shapes=tuple(self.get_state_shape()),
+             dtypes=self.get_state_dtype(),
+@@ -79,12 +99,13 @@ class MambaBase(AttentionLayerBase):
+             page_size_padded=page_size_padded,
+             mamba_type=self.mamba_type,
+             tp_replicated=self.is_kv_cache_tp_replicated,
+-            mamba_cache_mode=vllm_config.cache_config.mamba_cache_mode,
++            mamba_cache_mode=cache_config.mamba_cache_mode,
++            boundary_capture=boundary_capture,
+             # RecoverSSM verifies the whole window off one checkpoint, so it
+             # never writes the baseline's per-draft-token state slots.
+             num_speculative_blocks=(
+                 0
+-                if vllm_config.cache_config.use_kda_recoverssm
++                if cache_config.use_kda_recoverssm
+                 else vllm_config.num_speculative_tokens
+             ),
+         )
+diff --git a/vllm/models/glm5next/model_state.py b/vllm/models/glm5next/model_state.py
+index 2aea3d27a5..c50e210580 100644
+--- a/vllm/models/glm5next/model_state.py
++++ b/vllm/models/glm5next/model_state.py
+@@ -139,7 +139,20 @@ class Glm5NextModelState(MambaHybridModelState):
+         if self.uses_pooled_selector:
+             # The scheduler may recycle this request-state slot while selector
+             # raw-ring tags and its interval anchor still belong to the prior owner.
+-            self.selector_state_is_fresh_gpu[req_index].fill_(True)
++            # Only a boundary-checkpoint restore carries the producer's committed
++            # selector pools into this slot; the OffloadingConnector restores KV
++            # pages, never these per-slot buffers.  A restored prefix without a
++            # checkpoint still owns a recycled slot, so it keeps the fresh reset.
++            # The condition mirrors BoundaryCheckpointState.add_request, whose
++            # restore branch -- the only writer of these pools -- needs both
++            # fields before it clears the flag.
++            restored_selector_state = (
++                new_req_data.boundary_checkpoint is not None
++                and new_req_data.boundary_checkpoint_blocks is not None
++            )
++            self.selector_state_is_fresh_gpu[req_index].fill_(
++                not restored_selector_state
++            )
+             self.selector_committed_num_accepted_tokens_gpu[req_index].fill_(1)
+ 
+     def reset_kv_cache_state(self) -> None:
+@@ -157,6 +170,9 @@ class Glm5NextModelState(MambaHybridModelState):
+     def get_recurrent_checkpoint_acceptance(self) -> torch.Tensor:
+         return self.selector_committed_num_accepted_tokens_gpu
+ 
++    def get_recurrent_checkpoint_fresh(self) -> torch.Tensor:
++        return self.selector_state_is_fresh_gpu
++
+     def _prepare_selector_state(
+         self,
+         input_batch: InputBatch,
+diff --git a/vllm/models/qwen4_exp/nvidia/model_state.py b/vllm/models/qwen4_exp/nvidia/model_state.py
+index 183468978f..e727721dc9 100644
+--- a/vllm/models/qwen4_exp/nvidia/model_state.py
++++ b/vllm/models/qwen4_exp/nvidia/model_state.py
+@@ -177,8 +177,52 @@ class Qwen4ExpModelState(MambaHybridModelState):
+             # RoPE, and anchor pools still contain the prior owner's data.  The
+             # flag remains set through the complete next model forward so every
+             # QSA layer independently resets its slot.
+-            self.qsa_state_is_fresh_gpu[req_index].fill_(True)
++            #
++            # Only the boundary-checkpoint restore carries the producer's
++            # committed selector pools into this slot: the complex
++            # OffloadingConnector restores KV pages (main/compressed cache,
++            # align-Mamba columns), never these per-slot module buffers.  A
++            # resumed prefix without a checkpoint -- local hit or connector
++            # external-resume -- still owns a recycled slot, so it keeps the
++            # fresh reset.  The condition mirrors the rail's restore branch
++            # (BoundaryCheckpointState.add_request), the only pool writer.
++            checkpoint = new_req_data.boundary_checkpoint
++            restored_selector_state = (
++                checkpoint is not None
++                and new_req_data.boundary_checkpoint_blocks is not None
++            )
++            self.qsa_state_is_fresh_gpu[req_index].fill_(not restored_selector_state)
+             self.qsa_committed_num_accepted_tokens_gpu[req_index].fill_(1)
++            if restored_selector_state:
++                # The fresh-reset's anchor formula (first_position -
++                # accepted, in the QSA reset kernel) is skipped with the
++                # flag down, so seed the value it would have produced:
++                # prefix_len - 1.  The commit kernel overwrites it during
++                # the first forward (the anchor self-heals), so this keeps
++                # the pre-forward selector state consistent, not just the
++                # post-forward one.
++                anchor = checkpoint.num_tokens - 1
++                for module in self._qsa_state_modules():
++                    module.set_recurrent_checkpoint_anchor(req_index, anchor)
++
++    def _qsa_state_modules(self) -> tuple[Any, ...]:
++        """QSA layer modules exposing the per-request selector pools.
++
++        Mirrors ``BoundaryCheckpointState.target_modules``: the raw ring /
++        logical-tag / RoPE / anchor pools are per-layer module buffers
++        indexed by request slot, so seeding or reading one request's
++        selector state goes through every module that publishes the
++        recurrent-checkpoint accessors.
++        """
++        modules = self.__dict__.get("_qsa_state_module_cache")
++        if modules is None:
++            modules = tuple(
++                module
++                for module in self.model.modules()
++                if hasattr(module, "set_recurrent_checkpoint_anchor")
++            )
++            self._qsa_state_module_cache = modules
++        return modules
+ 
+     def get_recurrent_checkpoint_tensors(self) -> tuple[torch.Tensor, ...]:
+         return (
+@@ -189,6 +233,9 @@ class Qwen4ExpModelState(MambaHybridModelState):
+     def get_recurrent_checkpoint_acceptance(self) -> torch.Tensor:
+         return self.qsa_committed_num_accepted_tokens_gpu
+ 
++    def get_recurrent_checkpoint_fresh(self) -> torch.Tensor:
++        return self.qsa_state_is_fresh_gpu
++
+     def _prepare_qsa_state(
+         self,
+         input_batch: InputBatch,
+diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
+index 84812b69ba..4ba5e0eb46 100644
+--- a/vllm/v1/core/kv_cache_manager.py
++++ b/vllm/v1/core/kv_cache_manager.py
+@@ -1095,6 +1095,10 @@ class KVCacheManager:
+             bool: True if the prefix cache is successfully reset,
+             False otherwise.
+         """
++        # Capture pins are not request-owned; the pool reset releases them
++        # even while stores are still pending.
++        for mgr in self.coordinator.single_type_managers:
++            mgr.release_all_boundary_captures()
+         if not self.coordinator.reset_prefix_cache():
+             return False
+         if self.log_stats:
+@@ -1349,6 +1353,16 @@ class KVCacheManager:
+                 )
+         return offloads
+ 
++    def release_boundary_capture(self, block_id: int) -> None:
++        """Release a frozen capture block's manager pin (store ack / drop).
++
++        Only the Mamba manager that pinned ``block_id`` acts; the call is a
++        no-op for every other manager and for block ids never pinned, so a
++        connector may pass it fenced ids from any store kind.
++        """
++        for mgr in self.coordinator.single_type_managers:
++            mgr.release_boundary_capture(block_id)
++
+     def finalize_partial_tail_offloads(
+         self, request: Request
+     ) -> list[tuple[int, int, int]]:
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index e51cf97308..6e7cd13e25 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -368,6 +368,12 @@ class Scheduler(SchedulerInterface):
+         if self.connector is not None:
+             self.connector.bind_kv_cache_manager(self.kv_cache_manager)
+             self.connector.bind_gpu_block_pool(self.kv_cache_manager.block_pool)
++            # Frozen boundary capture: the connector releases the manager pin
++            # on a capture block when its store DMA acks or the offer is
++            # dropped (I4). No-op for block ids the manager never pinned.
++            self.connector.bind_boundary_capture_releaser(
++                self.kv_cache_manager.release_boundary_capture
++            )
+             if self.kv_cache_manager.boundary_checkpoints is not None:
+                 self.connector.bind_boundary_checkpoint_cache(self.kv_cache_manager)
+ 
+diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
+index bf53b82ffe..968b7b67fd 100644
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -962,6 +962,14 @@ class SingleTypeKVCacheManager(ABC):
+     def new_step_starts(self) -> None:
+         return None
+ 
++    def release_boundary_capture(self, block_id: int) -> None:
++        """Drop a frozen-capture pin. Only Mamba managers own capture blocks."""
++        return None
++
++    def release_all_boundary_captures(self) -> None:
++        """Release every frozen-capture pin (cache reset). No-op by default."""
++        return None
++
+ 
+ class FullAttentionManager(SingleTypeKVCacheManager):
+     supports_fine_grained_hash_lookup: ClassVar[bool] = True
+@@ -1907,6 +1915,18 @@ class MambaManager(SingleTypeKVCacheManager):
+             self.mamba_cache_mode == "align"
+             and kv_cache_spec.num_prefill_checkpoint_blocks > 0
+         )
++        # Frozen boundary capture is align-mode only; MambaSpec carries the
++        # enablement decision (align + OffloadingConnector + kv_offloading).
++        # The bookkeeping exists for every mamba manager: the cache-manager
++        # release paths consult it unconditionally.
++        self.boundary_capture = (
++            kv_cache_spec.boundary_capture and self.mamba_cache_mode == "align"
++        )
++        # Recorded crossings (promoted at the next schedule pass) and the
++        # manager pins on promoted capture blocks (released on store ack):
++        # dedicated single-writer blocks holding state@B.
++        self._pending_captures: dict[str, list[tuple[Request, KVCacheBlock, int]]] = {}
++        self._capture_pinned: dict[int, KVCacheBlock] = {}
+         # Mamba checkpoints follow Eagle's global replay boundary.
+         self.drop_eagle_checkpoint_block = False
+         self.cached_blocks_this_step: set[BlockHashWithGroupId] = set()
+@@ -1927,6 +1947,112 @@ class MambaManager(SingleTypeKVCacheManager):
+             self._producer_partial_tail_reqs: dict[str, tuple[KVCacheBlock, int]] = {}
+             self._packed_prefill_checkpoint_reqs: set[str] = set()
+ 
++    def release_boundary_capture(self, block_id: int) -> None:
++        """Drop the manager pin on a frozen capture block once its store job
++        completed (or the connector dropped the offer). Safe against
++        in-flight DMA races: the connector fences block reuse for pending
++        store jobs, and the copy rail already retained the endpoints until
++        the copy step was processed."""
++        block = self._capture_pinned.pop(block_id, None)
++        if block is not None:
++            self.block_pool.free_blocks([block])
++
++    def release_all_boundary_captures(self) -> None:
++        """Release every capture pin and pending record (cache reset)."""
++        blocks = list(self._capture_pinned.values())
++        self._capture_pinned.clear()
++        for entries in self._pending_captures.values():
++            blocks.extend(column for _, column, _ in entries)
++        self._pending_captures.clear()
++        self.block_pool.free_blocks(blocks)
++
++    def _record_boundary_capture(
++        self, request: Request, column_block: KVCacheBlock, boundary: int
++    ) -> None:
++        """Remember that the step scheduled right now will write state at
++        ``boundary`` into ``column_block``. Promoted (copy + offer) at the
++        start of the next schedule pass, before the column can advance."""
++        # Invariant (connector-aligned-builder ownership): a capture boundary
++        # is a state-block multiple, so the offload chunk grid claims it.
++        assert boundary % self.block_size == 0
++        # Hold the column against retirement until promotion (next pass).
++        self.block_pool.touch([column_block])
++        self._pending_captures.setdefault(request.request_id, []).append(
++            (request, column_block, boundary)
++        )
++
++    def _promote_boundary_captures(self) -> None:
++        """Turn recorded crossings into frozen capture blocks.
++
++        Runs at the start of the schedule pass after the producing step was
++        dispatched. The producing forward has completed (or is queued ahead of
++        everything on the worker's compute stream), so:
++        - the copy rail (``kv_cache_block_copies``, executed in the next
++          worker step after zeroing and BEFORE ``preprocess_state``'s precopy
++          and the forward) reads the column exactly at state@boundary;
++        - the connector offer ships with the same scheduler output, and the
++          store DMA is submitted one further step later, chained behind the
++          copy on the transfer stream.
++        The capture block is a dedicated pool block: never in a request's
++        column table, so precopy/postprocess/spec relocation cannot touch it,
++        and it is hashed at the boundary so local hits can resume past the
++        last live column too.
++        """
++        pending, self._pending_captures = self._pending_captures, {}
++        for req_id, entries in pending.items():
++            req_blocks = self.req_to_blocks.get(req_id, [])
++            for request, column_block, boundary in entries:
++                column_idx = boundary // self.block_size - 1
++                if (
++                    column_block.is_null
++                    or column_block.block_hash is None
++                    or column_block.block_hash_num_tokens != boundary
++                    or column_idx >= len(req_blocks)
++                    or req_blocks[column_idx] is not column_block
++                ):
++                    # The column was retired, re-hashed, CoW-moved, or the
++                    # producing step was rewound before committing state@B.
++                    # (Never gate on request.num_computed_tokens here: under
++                    # async scheduling it is an optimistic mirror that lags
++                    # the dispatched step.)
++                    self.block_pool.free_blocks([column_block])
++                    continue
++                try:
++                    capture_block = self.block_pool.get_new_blocks(1)[0]
++                except ValueError:
++                    # Pool pressure: skip the capture. The boundary is simply
++                    # not stored; hits fall back to recompute (correct, slower).
++                    self.block_pool.free_blocks([column_block])
++                    continue
++                # Ref plan (I4): the capture block keeps its allocation ref
++                # as a manager pin until the store DMA ack releases it
++                # (release_boundary_capture); it can then never be re-allocated
++                # as a copy destination, a live column, or zero-filled while
++                # its own content is still owed to the CPU tier. `touch` adds
++                # the copy-rail ref on each endpoint (released when the copy
++                # step is processed by take_kv_cache_block_copies /
++                # _free_cow_retained_blocks); the record-time ref on the
++                # column is dropped here.
++                self.block_pool.touch([column_block, capture_block])
++                self._pending_cow_copies.append((column_block, capture_block))
++                self._capture_pinned[capture_block.block_id] = capture_block
++                block_hash = self.block_pool.cache_partial_block(
++                    request=request,
++                    block=capture_block,
++                    num_tokens=boundary,
++                    kv_cache_group_id=self.kv_cache_group_id,
++                    block_size=self.block_size,
++                    replace_existing_hashes=True,
++                )
++                if block_hash is not None:
++                    # Content lands with the copy at the start of this step's
++                    # execution; defer same-step local hits (CoW precedent).
++                    self.cached_blocks_this_step.add(block_hash)
++                self._pending_boundary_state_offloads.append(
++                    (req_id, self.kv_cache_group_id, capture_block, boundary)
++                )
++                self.block_pool.free_blocks([column_block])
++
+     @classmethod
+     def find_longest_cache_hit(
+         cls,
+@@ -2463,6 +2589,14 @@ class MambaManager(SingleTypeKVCacheManager):
+                 for entry in self._pending_boundary_state_offloads
+                 if entry[0] != request_id
+             ]
++            # Recorded-but-not-yet-promoted crossings can never ship a copy
++            # now that the column table is going away: drop them along with
++            # the record-time pin on each column. (Already-promoted captures
++            # are pool-owned pins held for the store ack, not for this
++            # request, and stay pinned.)
++            dropped = self._pending_captures.pop(request_id, ())
++            if dropped:
++                self.block_pool.free_blocks([col for _, col, _ in dropped])
+         return super().pop_blocks_for_free(request_id)
+ 
+     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
+@@ -2515,6 +2649,35 @@ class MambaManager(SingleTypeKVCacheManager):
+                 self.cached_blocks_this_step.add(block.block_hash)
+                 if self.mamba_cache_mode == "align":
+                     assert block.block_hash_num_tokens is not None
++                    if self.boundary_capture:
++                        # Frozen capture: the step scheduled right now is the
++                        # producer for this boundary only when the chunk ends
++                        # exactly at it and this is the last (live) column the
++                        # forward writes. Offer the live column never; the
++                        # dedicated capture block is the sole store source.
++                        # The producing step is the one that COMPUTES the
++                        # boundary, i.e. its dispatched chunk still has the
++                        # boundary ahead of it (nct < boundary). When the
++                        # mirror already sits at the boundary, the crossing
++                        # was produced by an EARLIER step (connector-load
++                        # delay: the producing allocate ran with
++                        # delay_cache_blocks and cache_blocks only catches
++                        # up now). Promoting that record copies the column
++                        # AFTER the later step's forward advanced it past
++                        # the boundary -- state@prompt_final stored under
++                        # key@boundary, the original mislabel defect.
++                        # Reject: the boundary simply keeps no capture and
++                        # hits fall back to recompute (correct, slower).
++                        if (
++                            idx == num_cached_blocks_after - 1
++                            and num_tokens % self.block_size == 0
++                            and block.block_hash_num_tokens == num_tokens
++                            and request.num_computed_tokens < num_tokens
++                        ):
++                            self._record_boundary_capture(
++                                request, block, num_tokens
++                            )
++                        continue
+                     # Offer every retained boundary with its exact block.
+                     # The connector filters against its save window, which may
+                     # extend past the original prompt during resumed prefill.
+@@ -2529,6 +2692,12 @@ class MambaManager(SingleTypeKVCacheManager):
+ 
+     def new_step_starts(self) -> None:
+         self.cached_blocks_this_step.clear()
++        if self.boundary_capture:
++            # Promote last step's crossings before this pass allocates for the
++            # new step: the recorded live column still holds state@B until the
++            # producing forward's successor retires it, and the copy rail ships
++            # with this step's output.
++            self._promote_boundary_captures()
+ 
+     def _cache_partial_tail_block(
+         self,
+diff --git a/vllm/v1/kv_cache_interface.py b/vllm/v1/kv_cache_interface.py
+index 66ed299afb..6aaffa5e57 100644
+--- a/vllm/v1/kv_cache_interface.py
++++ b/vllm/v1/kv_cache_interface.py
+@@ -1084,6 +1084,13 @@ class MambaSpec(KVCacheSpec):
+     # False: the state is sharded across TP ranks (e.g. GDN). True: every TP
+     # rank holds the full state (e.g. the replicated PLE conv state).
+     tp_replicated: bool = False
++    # Frozen boundary capture: at every retention-grid crossing the step
++    # commits, the manager copies the live state column into a dedicated
++    # single-writer pool block before the column advances, so a connector
++    # boundary store never sources a column the next forward can clobber.
++    # Independent of `num_prefill_checkpoint_blocks` (the in-forward kernel
++    # export), which this model's backend cannot address safely.
++    boundary_capture: bool = False
+ 
+     def prefill_checkpoint_indices(
+         self, num_computed_tokens: int, num_tokens: int
+diff --git a/vllm/v1/worker/gpu/boundary_checkpoint.py b/vllm/v1/worker/gpu/boundary_checkpoint.py
+index 447502b5f8..06902fbdf7 100644
+--- a/vllm/v1/worker/gpu/boundary_checkpoint.py
++++ b/vllm/v1/worker/gpu/boundary_checkpoint.py
+@@ -674,6 +674,11 @@ class BoundaryCheckpointState:
+             # Prefill consumes a canonical committed prefix, not the previous
+             # verification interval's acceptance count.
+             self.model_state.get_recurrent_checkpoint_acceptance()[slot] = 1
++            # The pools this restore wrote are 'restored, not recycled'.
++            # The selector fresh flag gates the next forward's pool
++            # zeroing, so a restore that leaves it set would re-zero what
++            # it just copied -- clear it for the restored slot.
++            self.model_state.get_recurrent_checkpoint_fresh()[slot] = False
+             for module in self.target_modules:
+                 if hasattr(module, "set_recurrent_checkpoint_anchor"):
+                     module.set_recurrent_checkpoint_anchor(
+diff --git a/vllm/v1/worker/gpu/model_states/interface.py b/vllm/v1/worker/gpu/model_states/interface.py
+index 0a55b6118c..275b38c9c5 100644
+--- a/vllm/v1/worker/gpu/model_states/interface.py
++++ b/vllm/v1/worker/gpu/model_states/interface.py
+@@ -175,6 +175,17 @@ class ModelState(ABC):
+         """Return per-request selector acceptance for boundary MTP replay."""
+         raise NotImplementedError
+ 
++    def get_recurrent_checkpoint_fresh(self) -> torch.Tensor:
++        """Return the per-request selector fresh flag for boundary restores.
++
++        Any restore path must clear it: the pools the restore writes are
++        'restored, not recycled', and the next forward's fresh-reset would
++        otherwise re-zero them.  Models without a selector fresh flag raise;
++        the boundary path only calls this when a checkpoint (and therefore a
++        restorable pool set) exists.
++        """
++        raise NotImplementedError
++
+     def postprocess_state(
+         self,
+         idx_mapping: torch.Tensor,
+-- 
+2.55.0
+
