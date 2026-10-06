@@ -1,4 +1,4 @@
-From 07d86daa71cc03f895659ad0d144a697c53b9b87 Mon Sep 17 00:00:00 2001
+From d6c33e6528e05d235a7a731bda516ecd025115e7 Mon Sep 17 00:00:00 2001
 From: Carlos Augusto <mb@lab.how>
 Date: Sat, 19 Sep 2026 21:13:08 -0600
 Subject: [PATCH] Add opt-in output-token budget clamping
@@ -172,5 +172,5 @@ index bf0a94eea7..b6d3971e54 100644
              truncation_side=self.truncation_side,
              add_special_tokens=self.add_special_tokens,
 -- 
-2.55.0
+2.56.0
 

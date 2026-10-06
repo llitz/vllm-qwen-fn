@@ -1,0 +1,112 @@
+{
+  "kind": "quatrain_qwen38_ple_refinement_export",
+  "schema_version": 1,
+  "source_model": "Qwen/Qwen3.8-Flash-Next",
+  "source_revision": "de4b8e4d43b917e7706784d8bb445c9af86a3540",
+  "step": 1000,
+  "tensor_count": 299817,
+  "tensor_bytes": 110091566076,
+  "shards": 41,
+  "precision": {
+    "routed_experts": "nvfp4_group16",
+    "ple_tables": "nvfp4_group16",
+    "shared_experts": "mxfp8_block32",
+    "trained_norms": "float32",
+    "attention_ple_projections_convolution_embeddings_lm_head": "source_bf16",
+    "vision": "source_precision_unmodified",
+    "mtp_experts": "mxfp8_block32",
+    "mtp_non_expert": "source_bf16"
+  },
+  "activation_calibration": {
+    "progress": {
+      "documents": 59753,
+      "seconds": 3365.1721622999994,
+      "step": 863,
+      "steps": 863,
+      "tokens": 100134710
+    },
+    "policy": {
+      "input_scale_divisor": 2688.0,
+      "observed_layer_experts": 24570,
+      "statistic": "absolute_maximum_over_all_observed_rows_v1",
+      "w13": "layer_max_measured_scale_repeated_for_every_expert_v1",
+      "w2_fallback_layer_experts": [
+        {
+          "expert": 181,
+          "exported_scale": 0.01422991044819355,
+          "layer": 0
+        },
+        {
+          "expert": 193,
+          "exported_scale": 0.01422991044819355,
+          "layer": 0
+        },
+        {
+          "expert": 244,
+          "exported_scale": 0.01422991044819355,
+          "layer": 0
+        },
+        {
+          "expert": 271,
+          "exported_scale": 0.01422991044819355,
+          "layer": 0
+        },
+        {
+          "expert": 413,
+          "exported_scale": 0.01422991044819355,
+          "layer": 0
+        },
+        {
+          "expert": 424,
+          "exported_scale": 0.01422991044819355,
+          "layer": 0
+        }
+      ],
+      "w2_observed": "preserve_measured_per_expert_scale_v1",
+      "w2_unobserved": "same_layer_max_measured_w2_scale_v1"
+    },
+    "complete_expert_observation_coverage": false,
+    "source_trunk_step": 5500,
+    "recalibrated_after_ple_refinement": false
+  },
+  "validation": {
+    "inventory": "exact names/shapes/dtypes",
+    "packing": "every refined PLE table decoded and checked against training NVFP4 QDQ",
+    "write_readback": "all emitted tensors compared byte-for-byte",
+    "payload_hashes": false,
+    "full_model_serving": "not run",
+    "mtp_packing": "every decoded matrix checked against the block32 MXFP8 reference/QDQ",
+    "unmodified_shards": "independent byte copies; unchanged tensor inventory",
+    "mtp_acceptance_rate": "not measured",
+    "replicated_ple_norms": "exact agreement across all checkpoint owners",
+    "base_preservation": "unchanged shards copied independently; mixed shards retain exact non-PLE values"
+  },
+  "serving_requirements": [
+    "group16 E2M1/E4M3 PLE table loader and gather with one FP32 global scale",
+    "FP32 trained PLE and hyperconnection normalization weights",
+    "MXFP8 shared and MTP routed experts with E4M3 values and UE8M0 block32 scales"
+  ],
+  "mtp_quantization": {
+    "method": "post_training",
+    "experts": 512,
+    "block_shape": [
+      1,
+      32
+    ],
+    "values": "float8_e4m3fn",
+    "scales": "uint8_ue8m0",
+    "tensor_bytes_saved": 2437939200
+  },
+  "trunk_step": 5500,
+  "ple_refinement": {
+    "step": 1000,
+    "base_export": "Qwen3.8-Flash-Next-NVFP4-QAD-step5500-mxfp8-mtp-v1",
+    "trainable": "PLE table masters and FP32 PLE norms only",
+    "global_scale": 3.324236240587197e-05,
+    "global_scale_policy": {
+      "quantization": "nvfp4_group16_checkpoint_global_amax_v1",
+      "scale_source": "initial_checkpoint_ple_table_masters",
+      "global_scale_divisor": 2688.0
+    }
+  }
+}

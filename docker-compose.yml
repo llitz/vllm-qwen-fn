@@ -1,36 +1,61 @@
-# Karmic Kraken (kk) — karmic-kraken-beta base + 7-diff patch chain, baked.
-# Image: localhost/vllm-kk:kk-20260923, built from ./Dockerfile.vllm-kk
-#   (compose `build:` runs automatically when the image is absent; the
-#   in-image manifest.sha256 check ties the build to the exact chain in
-#   files/vllm-kk/patches/kk/).
+# Karmic Kraken (kk) — karmic-kraken-beta-20261005 base + 3-diff patch chain, baked.
+# Image: localhost/vllm-kk-patched:karmic-kraken-beta-20261005-4102660abd8a98b1,
+#   built from ./Dockerfile.vllm-kk (compose `build:` runs automatically when
+#   the image is absent; the in-image manifest.sha256 check ties the build to
+#   the exact chain in files/vllm-kk/patches/kk/).
 # Base: ghcr.io/local-inference-lab/vllm
-#   @sha256:445c58f040c7804e2bf795c3fe6250c1d13a48cd6ea6855e526f280906f8302e
-#   (tag karmic-kraken-beta-20260923-23a6d60a4b49c403; pins vllm@ccfef884dd).
-# Chain: 008,001,003_01_PR46960,005,003_02,003_03,003_04 (individual
-#   port.diffs; provenance in files/vllm-kk/patches/kk/chain.txt).
-#   003_04 exempts explicit aligned retention from PR #864's
-#   atomic-connector gate — REQUIRES --recurrent-checkpoint-policy aligned
-#   below; without the flag the gate still raises on Qwen model types.
+#   @sha256:fd74019fc217a541060093d18427c36330df6ac5700651b55593dafdbb936920
+#   (tag karmic-kraken-beta-20261005-4102660abd8a98b1; pins vllm@f1c2508f10,
+#   b12x@52640cb15d).
+# Chain: 008 -> 001 -> 005 (individual port.diffs; provenance in
+#   files/vllm-kk/patches/kk/chain.txt). The 003 offload pack and the
+#   aligned-retention gate fix are NOT here: merged/superseded upstream at
+#   this base (lil/vllm PRs #869 + #870, commit 212f46bfa8). Keep
+#   --recurrent-checkpoint-policy aligned below: the upstream gate accepts
+#   aligned retention for connectors declaring supports_aligned_hybrid_transfer
+#   at DCP==1 (OffloadingConnector does).
 # KV connector: complex OffloadingConnector (VLLM_USE_SIMPLE_KV_OFFLOAD=0 +
-#   explicit --kv-transfer-config). The 003 pack targets this connector;
-#   under SimpleCPUOffloadConnector the pack is inert.
-# Launch: bypasses the lil launcher (entrypoint override;
-#   lil-runtime-bootstrap then direct `vllm.entrypoints.cli.main serve`).
-# Model: local-inference-lab/Qwen3.8-Flash-Next-NVFP4 resolved offline from
-#   ./files/models/vllm.
+#   explicit --kv-transfer-config) — serves CPU-tier prefix hits for the
+#   align-mode Mamba + QSA hybrid, including restored recurrent state at
+#   aligned boundaries.
+# Launch: direct vllm serve + profile-env eval. The image's lil launcher
+#   blocklists the OffloadingConnector flags, so the serve command is carried
+#   here; the launcher's profile/hardware/common ENV layers are still consumed
+#   verbatim via `eval $(python -m kk_profile_env)` (plugins/), which prints
+#   the launcher's --print-config environment (JIT namespace
+#   /cache/jit/<runtime-lock-sha>/<profile-id>, b12x/NCCL tuning, fastokens,
+#   CUDA arch). Do not re-add those env vars here — they come from the image.
+# Model: local-inference-lab/Qwen3.8-Flash-Next-NVFP4-MXFP8-CSF-QAD
+#   (FP4-CSF QAD) @ revision ac1c8d8edfb88a41df837e8ca431e0ec237c139d,
+#   resolved offline from ./files/models/vllm (HF cache). Served through the
+#   FP4-CSF serving dir in files/vllm-kk/csf (metadata + rewritten
+#   config.json; weights stay in the snapshot via checkpoint_root, which
+#   assumes the snapshot lives at /models/vllm/models--local-inference-lab--
+#   Qwen3.8-Flash-Next-NVFP4-MXFP8-CSF-QAD/snapshots/ac1c8d8.../).
+#   --quantization/--load-format nvfp4_csf must match; moe-backend b12x, no
+#   expert parallelism (image contract).
+# Context: --max-model-len 524288 via YaRN --hf-overrides (factor 2.0 over
+#   the checkpoint's 262144). max_position_embeddings must ALSO be raised to
+#   524288 in the override (vLLM YaRN convention: the config carries the
+#   scaled limit): the MTP draft derives its own max_model_len from it and
+#   the b12x QSA binding limit comes from the DRAFT config — leaving 262144
+#   fails CUDA-graph capture with "QSA sequence length 524288 exceeds the
+#   configured limit 262144".
+# KV sizing: --kv-cache-memory-bytes 17000000000 (15.83 GiB) measured
+#   1,106,972 KV tokens / 2.11x concurrency @ 524,288 on a 96 GB RTX PRO
+#   6000. 17.3G fails post-startup with CUDA OOM on the first real forward —
+#   the pin must leave headroom for eager activation spikes, not just
+#   profiling. Re-measure the "GPU KV cache size" line after any base bump
+#   or checkpoint swap.
 # Startup check: grep the log for "Setting attention block size to N
 #   tokens"; N must divide --prefix-cache-retention-interval (3008 expected
 #   on RTX PRO 6000 + b12x).
-# Runtime bind mounts (read-only): ./files/vllm-kk/middleware ->
-#   /app/middleware, ./files/vllm-kk/plugins -> /app/plugins,
-#   ./files/vllm-kk/cache -> /cache (JIT caches), chat template from
-#   ./files/models/vllm/chat_template.jinja.
 services:
   vllm-kk:
     build:
       context: .
       dockerfile: Dockerfile.vllm-kk
-    image: localhost/vllm-kk:kk-20260923
+    image: localhost/vllm-kk-patched:karmic-kraken-beta-20261005-4102660abd8a98b1
     container_name: vllm-kk
     init: true
     security_opt:
@@ -41,89 +66,37 @@ services:
       stack: 67108864
     entrypoint: ["/bin/bash", "-lc"]
     environment:
+      # Only what the image profile layers do NOT set. Everything else
+      # (OMP/NCCL/B12X/VLLM_* tuning, JIT dirs) comes from kk_profile_env.
       - LLAMAKEY
-      - MODEL=local-inference-lab/Qwen3.8-Flash-Next-NVFP4
       - PORT=8000
-      - TP=1
       - HF_HUB_CACHE=/models/vllm
       - HF_HUB_OFFLINE=1
       - TRANSFORMERS_OFFLINE=1
       - VLLM_NO_USAGE_STATS=1
       - DO_NOT_TRACK=1
-      - OMP_NUM_THREADS=2
-      - CUDA_DEVICE_ORDER=PCI_BUS_ID
       - VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
-      - PYTHONPATH=/app/middleware:/app/plugins:/app/plugins/stats_logger
       - VLLM_USE_SIMPLE_KV_OFFLOAD=0
-      - VLLM_USE_V2_MODEL_RUNNER=1
-      - VLLM_WORKER_MULTIPROC_METHOD=spawn
-      - VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0
-      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-      - SAFETENSORS_FAST_GPU=1
-      - VLLM_PLE_CPU_OFFLOAD=1
-      - INSTANTTENSOR_BACKEND=BUFFERED
-      - VLLM_COMPUTE_NANS_IN_LOGITS=0
-      - VLLM_SSM_CONV_STATE_LAYOUT=DS
-      - VLLM_DISABLED_KERNELS=MarlinFP8ScaledMMLinearKernel
-      - VLLM_CAUSAL_CONV1D_UPDATE_HOIST=1
-      - VLLM_ENABLE_PCIE_ALLREDUCE=1
-      - VLLM_PCIE_ALLREDUCE_BACKEND=b12x
-      - VLLM_MXFP8_LM_HEAD=0
-      - VLLM_MTP_NVFP4_LM_HEAD=1
-      - VLLM_LM_HEAD_A16=1
-      - VLLM_QWEN3_8_FLASH_NEXT_MTP_COMPACT=1
-      - VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH=1
-      - VLLM_QWEN3_8_FLASH_NEXT_OVERLAP=1
-      - VLLM_B12X_DENSE_ACTIVATION_MODE=auto
-      - CUTE_DSL_ARCH=sm_120a
-      - B12X_DYNAMIC_SPLIT_ROUTE_COMPUTE=1
-      - B12X_DYNAMIC_DIRECT_EXPERT_SCALES=1
-      - B12X_DYNAMIC_SPLIT_LOW_SMEM=1
-      - B12X_DYNAMIC_SKIP_SPLIT_BARRIER_RESET=1
-      - B12X_DYNAMIC_SPLIT_FAST_PREPARE=1
-      - B12X_DYNAMIC_WORK_SOURCE=persistent_grid
-      - B12X_DYNAMIC_DETERMINISTIC_OUTPUT=0
-      - B12X_DYNAMIC_SPLIT_COMPUTE_MAC=224
-      - B12X_DENSE_SPLITK_TURBO=1
-      - B12X_PCIE_ONESHOT_THREADS=512
-      - B12X_PCIE_ONESHOT_BLOCK_LIMIT=4
-      - B12X_PCIE_ONESHOT_PDL=1
-      - B12X_MHC_PDL=1
-      - NCCL_IB_DISABLE=1
-      - NCCL_P2P_LEVEL=SYS
-      - NCCL_CUMEM_ENABLE=0
-      - NCCL_PROTO=LL,LL128,Simple
-      - NCCL_MIN_NCHANNELS=16
-      - NCCL_MAX_NCHANNELS=16
-      - NCCL_BUFFSIZE=2097152
-      # --- JIT caches under the mounted /cache volume ---
-      - XDG_CACHE_HOME=/cache
-      - VLLM_CACHE_ROOT=/cache/vllm
-      - VLLM_CACHE_DIR=/cache/vllm
-      - TRITON_CACHE_DIR=/cache/triton
-      - CUTE_DSL_CACHE_DIR=/cache/cute-dsl
-      - B12X_CUTE_COMPILE_CACHE_DIR=/cache/b12x/cute
-      - B12X_COMPILE_CACHE_DIR=/cache/b12x/compile
-      - SPARKINFER_COMPILE_CACHE_DIR=/cache/b12x/compile
-      - TORCHINDUCTOR_CACHE_DIR=/cache/torchinductor
-      - CUDA_CACHE_PATH=/cache/cuda
+      - PYTHONPATH=/app/middleware:/app/plugins:/app/plugins/stats_logger
     devices:
       - "nvidia.com/gpu=all"
     volumes:
       - ./files/models:/models:ro
+      - ./files/vllm-kk/csf:/models/csf:ro
       - ./files/vllm-kk/cache:/cache
       - ./files/vllm-kk/middleware:/app/middleware:ro
       - ./files/vllm-kk/plugins:/app/plugins:ro
     command:
       - >-
-        unset NCCL_GRAPH_FILE;
+        eval "$(/opt/venv/bin/python -m kk_profile_env)";
         exec /opt/venv/bin/lil-runtime-bootstrap
-        /opt/venv/bin/python -m vllm.entrypoints.cli.main serve "$${MODEL}"
+        /opt/venv/bin/python -m vllm.entrypoints.cli.main serve
+        /models/csf/Qwen3.8-Flash-Next-NVFP4-MXFP8-CSF-QAD-90e8eb0edd51
         --served-model-name qwen3.8-27b
         --api-key "$${LLAMAKEY}"
         --host 0.0.0.0
         --port "$${PORT}"
-        --tensor-parallel-size "$${TP}"
+        --tensor-parallel-size 1
         --pipeline-parallel-size 1
         --prefix-cache-retention-interval 3008
         --mamba-cache-mode align
@@ -134,16 +107,17 @@ services:
         --async-scheduling
         --dtype bfloat16
         --kv-cache-dtype fp8
+        --kv-cache-memory-bytes 17000000000
         --kv-offloading-size 35.6
         --enable-cumem-allocator
-        --quantization modelopt_mixed
+        --quantization nvfp4_csf
+        --load-format nvfp4_csf
         --block-size 64
-        --load-format instanttensor
         --max-num-seqs 16
         --max-num-batched-tokens 6019
         --mm-encoder-tp-mode data
         --mm-processor-cache-gb 0
-        --speculative-config '{"method":"mtp","num_speculative_tokens":3,"moe_backend":"b12x"}'
+        --speculative-config '{"method":"mtp","num_speculative_tokens":3,"draft_sample_method":"probabilistic","rejection_sample_method":"standard","moe_backend":"b12x"}'
         --gdn-decode-kernel b12x
         --linear-backend b12x
         --moe-backend b12x
@@ -159,8 +133,8 @@ services:
         --middleware vllm_defaults.FrequencyPenaltyMiddleware
         --middleware vllm_middleware_strict_tool_calling.StrictToolCallingMiddleware
         --max-model-len 524288
+        --hf-overrides '{"text_config":{"max_position_embeddings":524288,"rope_parameters":{"mrope_interleaved":true,"mrope_section":[11,11,10],"rope_type":"yarn","rope_theta":10000000,"partial_rotary_factor":0.25,"factor":2.0,"original_max_position_embeddings":262144}}}'
         --kv-transfer-config '{"kv_connector":"OffloadingConnector","kv_role":"kv_both"}'
-        --kv-cache-memory-bytes 15490411776
     ports:
       - "8000:8000"
     healthcheck:

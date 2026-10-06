@@ -1,4 +1,4 @@
-From d2a8d6c0a04cca23d517d049c52da5c6c7b9d9db Mon Sep 17 00:00:00 2001
+From 90d709c9b883e47a0c66000879191055868fffef Mon Sep 17 00:00:00 2001
 From: Carlos Augusto <mb@lab.how>
 Date: Sat, 19 Sep 2026 22:31:33 -0600
 Subject: [PATCH] Mirror Qwen3.8 text max_position_embeddings onto composite
@@ -108,11 +108,11 @@ index 0000000000..6c9c2a368d
 +    )
 +    assert config.max_position_embeddings == 131072
 diff --git a/vllm/models/qwen3_8_flash_next/config.py b/vllm/models/qwen3_8_flash_next/config.py
-index d00d4c5946..4713f1f4de 100644
+index ff22c33b23..dc6d82aefa 100644
 --- a/vllm/models/qwen3_8_flash_next/config.py
 +++ b/vllm/models/qwen3_8_flash_next/config.py
-@@ -25,6 +25,12 @@ class Qwen3_8FlashNextTextConfig(Qwen4ExpTextConfig):
-     supports_full_tp_dcp_with_kv_gather = True
+@@ -24,6 +24,12 @@ class Qwen3_8FlashNextTextConfig(Qwen4ExpTextConfig):
+     model_type = "qwen3_8_flash_next_text"
  
      def __init__(self, **kwargs: Any) -> None:
 +        # M-RoPE metadata keys are vLLM-side extensions; transformers'
@@ -124,7 +124,7 @@ index d00d4c5946..4713f1f4de 100644
          super().__init__(**kwargs)
  
  
-@@ -36,6 +42,26 @@ class Qwen3_8FlashNextConfig(Qwen4ExpConfig):
+@@ -35,6 +41,26 @@ class Qwen3_8FlashNextConfig(Qwen4ExpConfig):
      }
  
      def __init__(self, **kwargs: Any) -> None:
@@ -152,5 +152,5 @@ index d00d4c5946..4713f1f4de 100644
  
  
 -- 
-2.55.0
+2.56.0
 

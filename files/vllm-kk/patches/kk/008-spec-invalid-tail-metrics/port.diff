@@ -1,4 +1,4 @@
-From ae9cd6b7fbb0df796c9287141b5b97b0f6ee4e20 Mon Sep 17 00:00:00 2001
+From 89c5b30b5277af8a9a4d6c6caa5d5a4dbcc22135 Mon Sep 17 00:00:00 2001
 From: Carlos Augusto <mb@lab.how>
 Date: Sat, 19 Sep 2026 21:11:31 -0600
 Subject: [PATCH] Preserve accepted speculative grammar tails in metrics
@@ -46,10 +46,10 @@ index 93e1d7d414..ef11f43b3f 100644
      scheduler = create_scheduler(num_speculative_tokens=3)
      assert scheduler.spec_decode_metrics_level == "none"
 diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
-index 6e5ea6d15b..e51cf97308 100644
+index dced44674c..8a6478357a 100644
 --- a/vllm/v1/core/sched/scheduler.py
 +++ b/vllm/v1/core/sched/scheduler.py
-@@ -2822,16 +2822,13 @@ class Scheduler(SchedulerInterface):
+@@ -2998,16 +2998,13 @@ class Scheduler(SchedulerInterface):
                          req_index
                      ]
                      assert 0 <= num_draft_tokens <= num_scheduled_draft_tokens
@@ -71,7 +71,7 @@ index 6e5ea6d15b..e51cf97308 100644
                  assert num_accepted <= num_draft_tokens, (
                      f"{req_id}: accepted={num_accepted}, "
                      f"valid_drafts={num_draft_tokens}, "
-@@ -2839,6 +2836,14 @@ class Scheduler(SchedulerInterface):
+@@ -3015,6 +3012,14 @@ class Scheduler(SchedulerInterface):
                      f"grammar_invalid="
                      f"{(scheduler_output.num_invalid_spec_tokens or {}).get(req_id, 0)}"
                  )
@@ -87,5 +87,5 @@ index 6e5ea6d15b..e51cf97308 100644
                  # including drafts omitted by adaptive verification.
                  num_rejected = num_scheduled_draft_tokens - num_accepted
 -- 
-2.55.0
+2.56.0
 

@@ -1,12 +1,13 @@
-# karmic-kraken-beta-20260923-23a6d60a4b49c403 — vllm-kk serving bundle
+# karmic-kraken-beta-20261005-4102660abd8a98b1 — vllm-kk serving bundle
 
-Self-contained bundle for serving **Qwen3.8-Flash-Next-NVFP4** on
-karmic-kraken-beta: the pinned base image plus a 7-diff patch chain baked at
-build time, the compose service definition, and the runtime files
-(middleware, plugins, chat template) the service bind-mounts.
+Self-contained bundle for serving **Qwen3.8-Flash-Next-NVFP4-MXFP8-CSF-QAD**
+(FP4-CSF QAD checkpoint) on karmic-kraken-beta: the pinned base image plus a
+3-diff patch chain baked at build time, the compose service definition, the
+FP4-CSF serving dir, and the runtime files (middleware, plugins, chat
+template) the service bind-mounts.
 
 Branch name = ghcr tag of the pinned base image. The shipped vllm version is
-`0.1.dev21739+g5942b493c` (see `files/vllm-kk/patches/kk/version.txt`).
+`0.1.dev22052+g90d709c9b` (see `files/vllm-kk/patches/kk/version.txt`).
 
 ## Contents
 
@@ -14,87 +15,97 @@ Branch name = ghcr tag of the pinned base image. The shipped vllm version is
 |---|---|
 | `docker-compose.yml` | `vllm-kk` service: build + run definition |
 | `Dockerfile.vllm-kk` | applies the chain over the base, verifies per-file sha256, stamps version |
-| `files/vllm-kk/patches/kk/` | chain inputs: 7 bundle dirs (`port.diff` + reference files + READMEs) + `manifest.sha256`, `version.txt`, `head.txt`, `chain.txt` |
+| `files/vllm-kk/patches/kk/` | chain inputs: 3 bundle dirs (`port.diff` + reference files + READMEs) + `manifest.sha256`, `version.txt`, `head.txt`, `chain.txt` |
+| `files/vllm-kk/csf/` | FP4-CSF serving dir (metadata + rewritten `config.json`; weights stay in the HF snapshot via `checkpoint_root`) |
 | `files/vllm-kk/middleware/` | `vllm_defaults.py`, `vllm_middleware_strict_tool_calling.py` (mounted to `/app/middleware`) |
-| `files/vllm-kk/plugins/` | `qwen_clean_reasoning.py`, `stats_logger/` (mounted to `/app/plugins`) |
-| `files/templates/qwen/chat_template.jinja` | served chat template (`qwen3.8-froggeric-v22.5`, locally tuned: proper `high` thinking level, default effort `xhigh`); copy into your model dir — the compose reads it at `/models/vllm/chat_template.jinja` |
+| `files/vllm-kk/plugins/` | `qwen_clean_reasoning.py`, `kk_profile_env.py`, `stats_logger/` (mounted to `/app/plugins`) |
+| `files/templates/qwen/chat_template.jinja` | served chat template; copy into your model dir — the compose reads it at `/models/vllm/chat_template.jinja` |
 
-External, not in this bundle: the model snapshot (`./files/models/vllm`,
-offline HF cache for `local-inference-lab/Qwen3.8-Flash-Next-NVFP4`) and
-`./files/vllm-kk/cache` (JIT caches; created on first run).
+External, not in this bundle: the model snapshot
+(`./files/models/vllm`, offline HF cache for
+`local-inference-lab/Qwen3.8-Flash-Next-NVFP4-MXFP8-CSF-QAD` at revision
+`ac1c8d8edfb88a41df837e8ca431e0ec237c139d`) and `./files/vllm-kk/cache`
+(JIT caches; created on first run).
+
+## Model: FP4-CSF QAD checkpoint
+
+The checkpoint stores routed-expert scales losslessly compressed; B12X reads
+them compressed and they stay compressed in GPU memory (more room for KV).
+vLLM cannot open the raw CSF repo layout (`metadata/` + `tensors/` +
+`manifest.json`) directly, so the image's launcher synthesizes a serving dir
+(metadata files + a `config.json` whose `quantization_config` names the CSF
+reader and the checkpoint root). This bundle ships that serving dir under
+`files/vllm-kk/csf/`, mounted at `/models/csf`; `checkpoint_root` assumes the
+snapshot sits at `/models/vllm/models--local-inference-lab--Qwen3.8-Flash-Next-NVFP4-MXFP8-CSF-QAD/snapshots/ac1c8d8.../`
+(i.e. `./files/models/vllm/...` with the default compose mount). The dir
+name embeds `sha256(checkpoint_root)[:12]` — if you change the mount layout,
+regenerate it with the image's own
+`runtime.launcher.csf_serving_config` (same steps as
+`prepare_csf_checkpoint`).
+
+`--quantization` and `--load-format` must both be `nvfp4_csf`; MoE backend
+must be `b12x` without expert parallelism (image contract).
+
+## Context: YaRN to 524,288
+
+The CSF checkpoint ships `rope_type: default` at 262,144. The compose
+extends it to 524,288 with `--hf-overrides`: the yarn block (factor 2.0,
+`original_max_position_embeddings: 262144`) plus `max_position_embeddings:
+524288` — vLLM's YaRN convention is that the config carries the SCALED
+limit, and the MTP draft derives its own `max_model_len` (hence the b12x
+QSA binding limit) from the draft config. Omitting the scaled limit fails
+CUDA-graph capture with `QSA sequence length 524288 exceeds the configured
+limit 262144`.
+
+## KV sizing
+
+`--kv-cache-memory-bytes 17000000000` (15.83 GiB) measured **1,106,972 KV
+tokens / 2.11x concurrency @ 524,288** on a 96 GB RTX PRO 6000 with this
+base + checkpoint. 17.3G boots but dies on the first real forward (CUDA
+OOM — profiling does not cover eager activation spikes); 15.87G measures
+1,033,444 tokens. Re-measure the `GPU KV cache size` boot line after any
+base bump or checkpoint swap.
 
 ## Provenance
 
-- Base: `ghcr.io/local-inference-lab/vllm@sha256:445c58f040c7804e2bf795c3fe6250c1d13a48cd6ea6855e526f280906f8302e`
-  (tag `karmic-kraken-beta-20260923-23a6d60a4b49c403`), vllm source
-  `ccfef884dd` = integration/karmic-kraken-beta tip 2026-09-23.
-- Chain: branch `kk-tip-20260923`, head `5942b493c3eb44ad3bb30e6d8b2b1e4dd4d9b09a`,
-  7 commits in order `008 -> 001 -> 003_01_PR46960 -> 005 -> 003_02 ->
-  003_03 -> 003_04` (full shas + subjects in `chain.txt`).
-- Proof: applying the 7 `port.diff`s onto the base `vllm/` tree reproduces
+- Base: `ghcr.io/local-inference-lab/vllm@sha256:fd74019fc217a541060093d18427c36330df6ac5700651b55593dafdbb936920`
+  (tag `karmic-kraken-beta-20261005-4102660abd8a98b1`; the tag suffix is the
+  lil assembly sha256, not a commit), vllm source `f1c2508f10` =
+  integration/karmic-kraken-beta tip 2026-10-05, b12x `52640cb15d`.
+- Chain: 3 commits `008 -> 001 -> 005`, head
+  `90d709c9b883e47a0c66000879191055868fffef` (full shas + subjects in
+  `chain.txt`).
+- Proof: applying the 3 `port.diff`s onto the base `vllm/` tree reproduces
   the chain-head tree byte-exact; the build re-verifies every patched
-  package file against `manifest.sha256` (18 files) inside the image.
-- Upstream pairing: 003_01/003_02/003_03 + 003_04 correspond to
-  local-inference-lab/vllm PR #867 (content accepted into the beta line;
-  003_04 later extended upstream into a
-  `supports_aligned_hybrid_transfer()` connector capability hook).
-- 001 (per-request `max_tokens` clamp) and 005 (YaRN/M-RoPE config
-  validation for qwen3_8_flash_next) are local-only patches, not submitted
-  upstream.
+  package file against `manifest.sha256` (4 files) inside the image.
+- Dropped vs the previous bundle (`karmic-kraken-beta-20260923-23a6d60a4b49c403`):
+  the 003 pack (stale-KV tracking, CoW store-range alignment, align-Mamba
+  external-hit serving) merged upstream as local-inference-lab/vllm PRs
+  #869 + #870 with identical patch-ids, and the aligned-retention gate fix
+  was superseded by upstream `212f46bfa8` (accepts
+  `--recurrent-checkpoint-policy aligned` for connectors declaring
+  `supports_aligned_hybrid_transfer` at DCP==1 — `OffloadingConnector`
+  does). 002/004 had already been absorbed upstream at the previous tip.
 
-## Patch chain
+## Launch notes
 
-| bundle | what |
-|---|---|
-| `008-spec-invalid-tail-metrics` | keep spec-decode acceptance metrics internally valid when grammar validation marks a trailing suffix invalid |
-| `001-clamp_max_tokens` | per-request body field clamping output reservation to context headroom (local-only) |
-| `003_01_PR46960-stale-kv-alloc` | offloading scheduler must not allocate from stale KV state (upstream PR 46960 port) |
-| `005-qwen-rope-config-validation` | accept M-RoPE metadata keys in rope validation; mirror text-config context limit onto the composite (local-only) |
-| `003_02-offload-cow-zip-align` | CoW zip alignment for offloaded hybrid state blocks |
-| `003_03-mamba-offload-serve-fix` | serve external prefix hits for align-mode Mamba hybrids (boundary captures, padded QSA page refs) |
-| `003_04-aligned-policy-gate-fix` | exempt explicit `--recurrent-checkpoint-policy aligned` from the atomic request-boundary connector requirement |
+- The image's lil launcher (`lil-entrypoint --profile qwen38-flash-next`)
+  refuses the OffloadingConnector flags by policy, so this bundle runs
+  `vllm serve` directly but still consumes the launcher's resolved
+  environment via `plugins/kk_profile_env.py` (`eval` in the command). The
+  JIT caches land under `/cache/jit/<runtime-lock-sha>/<profile-id>/` and
+  self-invalidate per base build.
+- First boot on a fresh cache compiles the b12x kernel set (GDN prefill
+  autotune ~7 min); subsequent boots hit the on-disk caches.
+- CPU tier: `--kv-offloading-size 35.6` (GiB) needs `/dev/shm` headroom
+  (`shm_size: 36g` above).
 
-## Build & run
+## Startup checks
 
-From the compose project dir (this bundle's layout is the build context):
-
-```
-docker compose build vllm-kk     # or: podman compose build vllm-kk
-docker compose up -d vllm-kk
-```
-
-Requirements:
-- NVIDIA GPU, single card, full memory (Blackwell-class; RTX PRO 6000
-  validated). `devices: nvidia.com/gpu=all`.
-- `LLAMAKEY` env var (API key) — passed through, never stored here.
-- Model snapshot at `./files/models/vllm` (offline; `HF_HUB_OFFLINE=1`).
-- Chat template copied to `./files/models/vllm/chat_template.jinja`.
-- On podman rootless: `group_add` + `x-podman.gidmaps` for the nvidia
-  device groups, and host networking or a compose-created network with
-  explicit `ports:` (see your local podman config).
-
-Build-time verification (all fail the build loudly):
-1. base guard — pinned file hash of `offloading/scheduler.py` must match;
-2. each `port.diff` applies individually (failure attributes to one diff);
-3. `sha256sum -c manifest.sha256` over the patched site-packages tree;
-4. import smoke of the patched scheduler/connector modules.
-
-Post-start verification:
-- log shows `v0.1.dev21739+g5942b493c`;
-- `Setting attention block size to 3008 tokens` (must divide the retention
-  interval);
-- no atomic-checkpoint gate raise (aligned policy + 003_04);
-- `GET :8000/health` -> 200; cold start with a cold JIT cache can exceed
-  10 minutes (b12x gdn_prefill autotune) — the healthcheck
-  `start_period: 10m` accounts for it.
-
-## Notes
-
-- `--recurrent-checkpoint-policy aligned` is mandatory with this image:
-  the default (`auto`) still trips PR #864's atomic-connector gate on Qwen
-  model types.
-- `--max-num-seqs 16 --max-cudagraph-capture-size 64` bounds CUDA graph
-  capture cost on the workstation Blackwell; `--kv-cache-memory-bytes
-  15490411776` pins the KV pool against the offload sizing.
-- Known non-fatal log noise: triton `matmul_ogs` import errors (mxfp4
-  fallback, base-image issue).
+1. `Setting attention block size to 3008 tokens` (must divide the retention
+   interval).
+2. `GPU KV cache size: ... tokens` (compare against the numbers above).
+3. `Creating v1 connector with name: OffloadingConnector` + mmap of ~38 GB.
+4. `Application startup complete` and `GET /health` 200.
+5. Spec decode on b12x: `Using 'B12X' NvFp4 MoE backend ...` and
+   `Using b12x CuTeDSL GDN prefill kernel`.
