@@ -1,4 +1,4 @@
-From 90d709c9b883e47a0c66000879191055868fffef Mon Sep 17 00:00:00 2001
+From b7bd843725a7b42775da0487780e00cb3cbc46b5 Mon Sep 17 00:00:00 2001
 From: Carlos Augusto <mb@lab.how>
 Date: Sat, 19 Sep 2026 22:31:33 -0600
 Subject: [PATCH] Mirror Qwen3.8 text max_position_embeddings onto composite

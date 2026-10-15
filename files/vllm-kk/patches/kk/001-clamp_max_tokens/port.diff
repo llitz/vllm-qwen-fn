@@ -1,4 +1,4 @@
-From d6c33e6528e05d235a7a731bda516ecd025115e7 Mon Sep 17 00:00:00 2001
+From 839afda71d81f013bb87fc10b0162377b142d12a Mon Sep 17 00:00:00 2001
 From: Carlos Augusto <mb@lab.how>
 Date: Sat, 19 Sep 2026 21:13:08 -0600
 Subject: [PATCH] Add opt-in output-token budget clamping

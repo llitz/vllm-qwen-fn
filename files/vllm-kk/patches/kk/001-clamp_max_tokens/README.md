@@ -1,15 +1,20 @@
-# 001-clamp_max_tokens (kk)
+# 001-clamp_max_tokens (kk-tip-20261013)
 
-Opt-in per-request output-token budget clamp: a request-level field caps
-generated tokens for clients that need a hard output budget independent of
-`max_tokens` semantics. Convenience patch — it never gates correctness
-paths.
+Opt-in per-request output-token budget clamp: a `max_tokens_budget`-style
+request field caps generated tokens for clients that need a hard output
+budget independent of `max_tokens` semantics. Diagnostic/convenience patch —
+NOT a corruption workaround (see workspace PLAN.md standing order; this patch
+never gates correctness paths).
 
-- Base: vllm `f1c2508f10` (karmic-kraken-beta tip 2026-10-05).
-- Chain commit: `d6c33e6528e05d235a7a731bda516ecd025115e7` (clean
-  cherry-pick of the kk-20260923 chain commit `07d86daa71`).
-- Apply: `git apply port.diff` (format-patch; `git am` also works). The
-  Dockerfile applies it with `--exclude='tests/*'`.
+- Lineage: tip `cf8193372e` -> kk `07d86daa71` (kk-20260923 chain) ->
+  prior kk `d6c33e6528` (kk-2026-10-05 chain) -> this base commit
+  `839afda71d` (clean cherry-pick onto the 20261013 tip).
+- Base: vllm `2e7b458480` (karmic-kraken-beta tip, force-pushed 2026-10-14).
+- Drift: none — zero commits touched `chat_completion/protocol.py` or
+  `completion/protocol.py` between the 2026-10-05 and 2026-10-13 tips, and
+  `git grep clamp_max_tokens` at the new tip returns no hits in `vllm/`, so
+  the patch is still required and not upstream-equivalent.
+- Apply: `git apply port.diff` (format-patch; `git am` also works).
 - Files: `chat_protocol.py` = patched
   `vllm/entrypoints/openai/chat_completion/protocol.py`;
   `completion_protocol.py` = patched

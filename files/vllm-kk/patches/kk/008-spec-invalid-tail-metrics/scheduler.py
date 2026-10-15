@@ -361,7 +361,6 @@ class Scheduler(SchedulerInterface):
             metrics_collector=self.kv_metrics_collector,
             watermark=self.scheduler_config.watermark,
             enable_boundary_checkpoints=vllm_config.use_request_boundary_checkpoints,
-            max_concurrent_batches=vllm_config.max_concurrent_batches,
             num_lookahead_tokens=self.num_lookahead_tokens,
             enable_mamba_fine_grained_prefix_cache=(
                 self.cache_config.enable_mamba_fine_grained_prefix_cache
@@ -912,6 +911,14 @@ class Scheduler(SchedulerInterface):
             else 0
         )
         has_eligible_decode = num_runnable_decodes > 0
+        # Queued requests compete for prefill lanes only while the waiting pass
+        # can admit one. Otherwise lanes given to them would idle while running
+        # chunked prefills wait for a lane, and the step would schedule nothing.
+        admission_open = (
+            self._pause_state == PauseState.UNPAUSED
+            and len(self.running) + self.num_waiting_for_streaming_input
+            < self.max_num_running_reqs
+        )
         # max_num_scheduled_tokens keeps decode streams moving while a long
         # prompt prefills. With no runnable decode it only shrinks the prefill
         # chunk, so such a step may use the full batched-token budget.
@@ -924,14 +931,6 @@ class Scheduler(SchedulerInterface):
             and step_token_cap < input_budget
         ):
             step_token_cap = token_budget = input_budget
-        # Queued requests compete for prefill lanes only while the waiting pass
-        # can admit one. Otherwise lanes given to them would idle while running
-        # chunked prefills wait for a lane, and the step would schedule nothing.
-        admission_open = (
-            self._pause_state == PauseState.UNPAUSED
-            and len(self.running) + self.num_waiting_for_streaming_input
-            < self.max_num_running_reqs
-        )
         prefill_interleave_step = (
             self.prefill_interleave_controller.begin_step(
                 running=self.running,
@@ -1815,37 +1814,6 @@ class Scheduler(SchedulerInterface):
                     full_sequence_must_fit=self.scheduler_reserve_full_isl,
                     reserved_blocks=reserved_blocks,
                     has_scheduled_reqs=bool(self.running),
-                    pending_boundary_requests=itertools.islice(
-                        itertools.chain(self.skipped_waiting, self.waiting),
-                        self.max_num_running_reqs,
-                    ),
-                    can_defer_boundary_restore=(
-                        request.boundary_checkpoint is not None
-                        and not load_kv_async
-                        and num_external_computed_tokens == 0
-                        # External imports need separate admission accounting.
-                        and self.connector is None
-                        and self.parallel_config.decode_context_parallel_size == 1
-                        and not self.use_pp
-                        and self.vllm_config.max_concurrent_batches <= 2
-                        and all(
-                            not isinstance(manager.kv_cache_spec, MambaSpec)
-                            or (
-                                manager.kv_cache_spec.mamba_cache_mode == "align"
-                                and manager.kv_cache_spec.num_prefill_checkpoint_blocks
-                                <= 1
-                                and 2 * (self.num_spec_tokens + 1) <= manager.block_size
-                            )
-                            for manager in (
-                                self.kv_cache_manager.coordinator.single_type_managers
-                            )
-                        )
-                        and any(
-                            self._request_is_runnable_decode(r)
-                            or r.request_id in num_scheduled_tokens
-                            for r in self.running
-                        )
-                    ),
                 )
 
                 if new_blocks is None:

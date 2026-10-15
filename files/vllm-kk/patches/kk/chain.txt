@@ -1,3 +1,3 @@
-89c5b30b5277af8a9a4d6c6caa5d5a4dbcc22135 Preserve accepted speculative grammar tails in metrics
-d6c33e6528e05d235a7a731bda516ecd025115e7 Add opt-in output-token budget clamping
-90d709c9b883e47a0c66000879191055868fffef Mirror Qwen3.8 text max_position_embeddings onto composite config
+cd10c0784cb4cb73733b15c3c8ed99dd93752795 Preserve accepted speculative grammar tails in metrics
+839afda71d81f013bb87fc10b0162377b142d12a Add opt-in output-token budget clamping
+b7bd843725a7b42775da0487780e00cb3cbc46b5 Mirror Qwen3.8 text max_position_embeddings onto composite config

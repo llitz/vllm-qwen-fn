@@ -1,12 +1,14 @@
-# Karmic Kraken (kk) — karmic-kraken-beta-20261005 base + 3-diff patch chain, baked.
-# Image: localhost/vllm-kk-patched:karmic-kraken-beta-20261005-4102660abd8a98b1,
+# Karmic Kraken (kk) — karmic-kraken-beta-20261013 base + 3-diff patch chain, baked.
+# Image: localhost/vllm-kk-patched:karmic-kraken-beta-20261013,
 #   built from ./Dockerfile.vllm-kk (compose `build:` runs automatically when
 #   the image is absent; the in-image manifest.sha256 check ties the build to
 #   the exact chain in files/vllm-kk/patches/kk/).
 # Base: ghcr.io/local-inference-lab/vllm
-#   @sha256:fd74019fc217a541060093d18427c36330df6ac5700651b55593dafdbb936920
-#   (tag karmic-kraken-beta-20261005-4102660abd8a98b1; pins vllm@f1c2508f10,
-#   b12x@52640cb15d).
+#   @sha256:31d8ac21adb95359796d45455ba3d77a92e4b5d9455f091c1bd178e24f53370a
+#   (tag karmic-kraken-beta-20261013; upstream tags no longer carry a hash
+#   suffix; pins vllm@2e7b458480, flashinfer 0.7.1@b4c35e6ec1 — B12X ships
+#   inside flashinfer/experimental/b12x, no separate wheel —
+#   lmcache_cumem@8ef537d6).
 # Chain: 008 -> 001 -> 005 (individual port.diffs; provenance in
 #   files/vllm-kk/patches/kk/chain.txt). The 003 offload pack and the
 #   aligned-retention gate fix are NOT here: merged/superseded upstream at
@@ -26,14 +28,18 @@
 #   /cache/jit/<runtime-lock-sha>/<profile-id>, b12x/NCCL tuning, fastokens,
 #   CUDA arch). Do not re-add those env vars here — they come from the image.
 # Model: local-inference-lab/Qwen3.8-Flash-Next-NVFP4-MXFP8-CSF-QAD
-#   (FP4-CSF QAD) @ revision ac1c8d8edfb88a41df837e8ca431e0ec237c139d,
-#   resolved offline from ./files/models/vllm (HF cache). Served through the
-#   FP4-CSF serving dir in files/vllm-kk/csf (metadata + rewritten
-#   config.json; weights stay in the snapshot via checkpoint_root, which
-#   assumes the snapshot lives at /models/vllm/models--local-inference-lab--
-#   Qwen3.8-Flash-Next-NVFP4-MXFP8-CSF-QAD/snapshots/ac1c8d8.../).
-#   --quantization/--load-format nvfp4_csf must match; moe-backend b12x, no
-#   expert parallelism (image contract).
+#   (QAD checkpoint) @ revision dc5b8ab2fa14bc4fecd6886273b7ebc6095662e2,
+#   standard HF/ModelOpt layout (21 shards under tensors/; config.json
+#   carries quantization_config with quant_method=modelopt, MIXED_PRECISION),
+#   served directly from the snapshot dir under the HF cache mount:
+#   /models/vllm/models--local-inference-lab--
+#   Qwen3.8-Flash-Next-NVFP4-MXFP8-CSF-QAD/snapshots/dc5b8ab2.../ (i.e.
+#   ./files/models/vllm/... with the default compose mount). The custom CSF
+#   loader + serving-dir rewrite from the previous bundle are gone upstream;
+#   --quantization modelopt_mixed --load-format instanttensor are the stock
+#   pair the image's launcher emits for this revision (compressed-scale
+#   reads, faster weight load). moe-backend b12x, no expert parallelism
+#   (image contract).
 # Context: --max-model-len 524288 via YaRN --hf-overrides (factor 2.0 over
 #   the checkpoint's 262144). max_position_embeddings must ALSO be raised to
 #   524288 in the override (vLLM YaRN convention: the config carries the
@@ -55,7 +61,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.vllm-kk
-    image: localhost/vllm-kk-patched:karmic-kraken-beta-20261005-4102660abd8a98b1
+    image: localhost/vllm-kk-patched:karmic-kraken-beta-20261013
     container_name: vllm-kk
     init: true
     security_opt:
@@ -82,7 +88,6 @@ services:
       - "nvidia.com/gpu=all"
     volumes:
       - ./files/models:/models:ro
-      - ./files/vllm-kk/csf:/models/csf:ro
       - ./files/vllm-kk/cache:/cache
       - ./files/vllm-kk/middleware:/app/middleware:ro
       - ./files/vllm-kk/plugins:/app/plugins:ro
@@ -91,7 +96,7 @@ services:
         eval "$(/opt/venv/bin/python -m kk_profile_env)";
         exec /opt/venv/bin/lil-runtime-bootstrap
         /opt/venv/bin/python -m vllm.entrypoints.cli.main serve
-        /models/csf/Qwen3.8-Flash-Next-NVFP4-MXFP8-CSF-QAD-90e8eb0edd51
+        /models/vllm/models--local-inference-lab--Qwen3.8-Flash-Next-NVFP4-MXFP8-CSF-QAD/snapshots/dc5b8ab2fa14bc4fecd6886273b7ebc6095662e2
         --served-model-name qwen3.8-27b
         --api-key "$${LLAMAKEY}"
         --host 0.0.0.0
@@ -110,8 +115,8 @@ services:
         --kv-cache-memory-bytes 17000000000
         --kv-offloading-size 35.6
         --enable-cumem-allocator
-        --quantization nvfp4_csf
-        --load-format nvfp4_csf
+        --quantization modelopt_mixed
+        --load-format instanttensor
         --block-size 64
         --max-num-seqs 16
         --max-num-batched-tokens 6019

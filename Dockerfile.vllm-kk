@@ -1,12 +1,13 @@
-# karmic-kraken-beta (tip 2026-10-05) + 3-patch chain (individual diffs, no tarballs).
+# karmic-kraken-beta (tip 2026-10-13) + 3-patch chain (individual diffs, no tarballs).
 #
 # Base pinned by immutable digest: ghcr.io/local-inference-lab/vllm
-# :karmic-kraken-beta-20261005-4102660abd8a98b1 (manifest
-# sha256:fd74019fc217a541060093d18427c36330df6ac5700651b55593dafdbb936920,
-# built from vllm f1c2508f10 = lil integration/karmic-kraken-beta tip,
-# b12x 52640cb15d — confirmed via in-image vllm/_version.py,
-# dev22049+gf1c2508f1; the tag suffix is the lil assembly sha256, not a
-# commit). The floating :karmic-kraken-beta tag is stale on this host —
+# :karmic-kraken-beta-20261013 (digest sha256:31d8ac21adb95359796d45455ba3d77a92e4b5d9455f091c1bd178e24f53370a,
+# built from vllm 2e7b458480 = lil integration/karmic-kraken-beta tip —
+# confirmed via in-image vllm/_version.py dev21826+g2e7b45848 and
+# /opt/venv/share/lil-runtime/manifest.json; B12X now ships inside
+# flashinfer 0.7.1 @ b4c35e6ec1 (flashinfer/experimental/b12x), no separate
+# b12x wheel; lmcache_cumem 8ef537d6). Upstream tags no longer carry a hash
+# suffix. The floating :karmic-kraken-beta tag is stale on this host —
 # never build from it.
 # Runtime stack (CUDA 13.4 / torch 2.14 nightly / python 3.12 / native
 # extensions / venv layout / entrypoint / ENV) inherited unchanged.
@@ -15,7 +16,7 @@
 # site-packages tree (paths repo-root-relative; tests/* excluded — not part
 # of the installed package). A failure attributes to exactly one diff.
 #
-# Chain (branch kk-tip-20261005 on base f1c2508f10; exact shas in staged
+# Chain (branch kk-tip-20261013 on base 2e7b458480; exact shas in staged
 # chain.txt, baked to /opt/venv/share/lil-runtime/chain.txt):
 #   008 -> 001 -> 005 (one port.diff each)
 #
@@ -36,7 +37,7 @@
 #   docker compose build vllm-kk                    # production
 #   docker compose -f docker-compose.test.yml build # test rig
 
-ARG BASE_IMAGE=ghcr.io/local-inference-lab/vllm@sha256:fd74019fc217a541060093d18427c36330df6ac5700651b55593dafdbb936920
+ARG BASE_IMAGE=ghcr.io/local-inference-lab/vllm@sha256:31d8ac21adb95359796d45455ba3d77a92e4b5d9455f091c1bd178e24f53370a
 FROM ${BASE_IMAGE}
 
 COPY files/vllm-kk/patches/kk/ /tmp/kk/
