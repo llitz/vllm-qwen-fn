@@ -1,14 +1,14 @@
-# karmic-kraken-beta-20261013 — vllm-kk serving bundle
+# karmic-kraken-beta-20261013.1 — vllm-kk serving bundle
 
 Self-contained bundle for serving **Qwen3.8-Flash-Next-NVFP4-MXFP8-CSF-QAD**
 (QAD checkpoint) on karmic-kraken-beta: the pinned base image plus a
-3-diff patch chain baked at build time, the compose service definition, and
+6-diff patch chain baked at build time, the compose service definition, and
 the runtime files (middleware, plugins, chat template) the service
 bind-mounts.
 
-Branch name = ghcr tag of the pinned base image (upstream tags no longer
-carry a hash suffix). The shipped vllm version is
-`0.1.dev21829+gb7bd84372` (see `files/vllm-kk/patches/kk/version.txt`).
+Branch name = ghcr tag of the pinned base image plus the bundle revision
+suffix (upstream tags no longer carry a hash suffix). The shipped vllm
+version is `0.1.dev21832+g850215bbb` (see `files/vllm-kk/patches/kk/version.txt`).
 
 ## Contents
 
@@ -16,7 +16,7 @@ carry a hash suffix). The shipped vllm version is
 |---|---|
 | `docker-compose.yml` | `vllm-kk` service: build + run definition |
 | `Dockerfile.vllm-kk` | applies the chain over the base, verifies per-file sha256, stamps version |
-| `files/vllm-kk/patches/kk/` | chain inputs: 3 bundle dirs (`port.diff` + reference files + READMEs) + `manifest.sha256`, `version.txt`, `head.txt`, `chain.txt` |
+| `files/vllm-kk/patches/kk/` | chain inputs: 6 bundle dirs (`port.diff` + reference files + READMEs) + `manifest.sha256`, `version.txt`, `head.txt`, `chain.txt` |
 | `files/vllm-kk/middleware/` | `vllm_defaults.py`, `vllm_middleware_strict_tool_calling.py` (mounted to `/app/middleware`) |
 | `files/vllm-kk/plugins/` | `qwen_clean_reasoning.py`, `kk_profile_env.py`, `stats_logger/` (mounted to `/app/plugins`) |
 | `files/templates/qwen/chat_template.jinja` | served chat template; copy into your model dir — the compose reads it at `/models/vllm/chat_template.jinja` |
@@ -70,19 +70,24 @@ base bump or checkpoint swap.
   integration/karmic-kraken-beta tip 2026-10-13; flashinfer 0.7.1
   `b4c35e6ec1` (B12X ships inside `flashinfer/experimental/b12x`, no
   separate wheel); lmcache_cumem `8ef537d6`.
-- Chain: 3 commits `008 -> 001 -> 005`, head
-  `b7bd843725a7b42775da0487780e00cb3cbc46b5` (full shas + subjects in
-  `chain.txt`).
-- Proof: applying the 3 `port.diff`s onto the base `vllm/` tree reproduces
+- Chain: 6 commits `008 -> 001 -> 005 -> 009 -> 010 -> 011`, head
+  `850215bbbcee1328c910911d90dee431247e2a29` (full shas + subjects in
+  `chain.txt`). 009-011 are the prefill-lane livelock fix chain: live
+  only when served with `--max-parallel-prefills` > 1; the default
+  lanes=1 path is untouched.
+- Proof: applying the 6 `port.diff`s onto the base `vllm/` tree reproduces
   the chain-head tree byte-exact; the build re-verifies every patched
-  package file against `manifest.sha256` (4 files) inside the image.
-- Dropped vs the previous bundle (the 2026-10-05 release): the FP4-CSF
+  package file against `manifest.sha256` (5 files) inside the image.
+- Dropped vs the 2026-10-05 release: the FP4-CSF
   serving dir (`files/vllm-kk/csf/`) and the custom CSF quantization
   loader — both removed upstream at this base; the checkpoint now serves
   directly from its snapshot with the stock `modelopt_mixed` /
-  `instanttensor` pair. The chain is the same 3 diffs, re-ported onto
-  the new tip (clean cherry-picks; per-patch lineage in the bundle-dir
-  READMEs). The 003 pack (stale-KV tracking, CoW store-range alignment,
+  `instanttensor` pair. The 008/001/005 chain is the same 3 diffs,
+  re-ported onto the new tip (clean cherry-picks); vs the 20261013
+  release (3 diffs) this bundle adds the 009-011 prefill-lane livelock
+  fix chain (new fix commits on the chain tip, not ports; per-patch
+  lineage in the bundle-dir READMEs). The 003 pack (stale-KV tracking,
+  CoW store-range alignment,
   align-Mamba external-hit serving) had merged upstream as
   local-inference-lab/vllm PRs #869 + #870 at the previous base, and the
   aligned-retention gate fix was superseded by upstream `212f46bfa8`

@@ -1,3 +1,6 @@
 cd10c0784cb4cb73733b15c3c8ed99dd93752795 Preserve accepted speculative grammar tails in metrics
 839afda71d81f013bb87fc10b0162377b142d12a Add opt-in output-token budget clamping
 b7bd843725a7b42775da0487780e00cb3cbc46b5 Mirror Qwen3.8 text max_position_embeddings onto composite config
+cbf82b123e5ad16a0536c9e7dc00518fb459ed8b Release prefill lane on async admission failure; age lane ranks
+88a92184115be0dc3ddf886abb622102a88c06d0 Preempt no-progress interleave pass; age stale lane ranks
+850215bbbcee1328c910911d90dee431247e2a29 Floor prefill-lane share to align quantum

@@ -1,5 +1,5 @@
-# Karmic Kraken (kk) — karmic-kraken-beta-20261013 base + 3-diff patch chain, baked.
-# Image: localhost/vllm-kk-patched:karmic-kraken-beta-20261013,
+# Karmic Kraken (kk) — karmic-kraken-beta-20261013 base + 6-diff patch chain, baked.
+# Image: localhost/vllm-kk-patched:karmic-kraken-beta-20261013.1,
 #   built from ./Dockerfile.vllm-kk (compose `build:` runs automatically when
 #   the image is absent; the in-image manifest.sha256 check ties the build to
 #   the exact chain in files/vllm-kk/patches/kk/).
@@ -9,13 +9,17 @@
 #   suffix; pins vllm@2e7b458480, flashinfer 0.7.1@b4c35e6ec1 — B12X ships
 #   inside flashinfer/experimental/b12x, no separate wheel —
 #   lmcache_cumem@8ef537d6).
-# Chain: 008 -> 001 -> 005 (individual port.diffs; provenance in
-#   files/vllm-kk/patches/kk/chain.txt). The 003 offload pack and the
+# Chain: 008 -> 001 -> 005 -> 009 -> 010 -> 011 (individual port.diffs;
+#   provenance in files/vllm-kk/patches/kk/chain.txt; 009-011 are the
+#   prefill-lane livelock fix chain). The 003 offload pack and the
 #   aligned-retention gate fix are NOT here: merged/superseded upstream at
 #   this base (lil/vllm PRs #869 + #870, commit 212f46bfa8). Keep
 #   --recurrent-checkpoint-policy aligned below: the upstream gate accepts
 #   aligned retention for connectors declaring supports_aligned_hybrid_transfer
 #   at DCP==1 (OffloadingConnector does).
+# Prefill lanes: --max-parallel-prefills via KK_MAX_PARALLEL_PREFILLS
+#   (unset = 1, the stock default; lanes>1 additionally requires the
+#   009-011 prefill-lane livelock fix chain present in the image).
 # KV connector: complex OffloadingConnector (VLLM_USE_SIMPLE_KV_OFFLOAD=0 +
 #   explicit --kv-transfer-config) — serves CPU-tier prefix hits for the
 #   align-mode Mamba + QSA hybrid, including restored recurrent state at
@@ -61,7 +65,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.vllm-kk
-    image: localhost/vllm-kk-patched:karmic-kraken-beta-20261013
+    image: localhost/vllm-kk-patched:karmic-kraken-beta-20261013.1
     container_name: vllm-kk
     init: true
     security_opt:
@@ -120,6 +124,7 @@ services:
         --block-size 64
         --max-num-seqs 16
         --max-num-batched-tokens 6019
+        --max-parallel-prefills "$${KK_MAX_PARALLEL_PREFILLS:-1}"
         --mm-encoder-tp-mode data
         --mm-processor-cache-gb 0
         --speculative-config '{"method":"mtp","num_speculative_tokens":3,"draft_sample_method":"probabilistic","rejection_sample_method":"standard","moe_backend":"b12x"}'

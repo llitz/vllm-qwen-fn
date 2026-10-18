@@ -1,4 +1,4 @@
-# karmic-kraken-beta (tip 2026-10-13) + 3-patch chain (individual diffs, no tarballs).
+# karmic-kraken-beta (tip 2026-10-13) + 6-patch chain (individual diffs, no tarballs).
 #
 # Base pinned by immutable digest: ghcr.io/local-inference-lab/vllm
 # :karmic-kraken-beta-20261013 (digest sha256:31d8ac21adb95359796d45455ba3d77a92e4b5d9455f091c1bd178e24f53370a,
@@ -18,7 +18,7 @@
 #
 # Chain (branch kk-tip-20261013 on base 2e7b458480; exact shas in staged
 # chain.txt, baked to /opt/venv/share/lil-runtime/chain.txt):
-#   008 -> 001 -> 005 (one port.diff each)
+#   008 -> 001 -> 005 -> 009 -> 010 -> 011 (one port.diff each)
 #
 # Dropped from the kk-20260923 chain: 002/004 (already upstream at the old
 # tip) and 003_01/003_02/003_03 (merged upstream as lil/vllm PRs #869 + #870,
@@ -27,7 +27,7 @@
 # supports_aligned_hybrid_transfer and DCP == 1; OffloadingConnector does).
 # Compose keeps --recurrent-checkpoint-policy aligned.
 #
-# Staged under files/vllm-kk/patches/kk/: the three bundle dirs above
+# Staged under files/vllm-kk/patches/kk/: the six bundle dirs above
 # (port.diff + reference files), plus manifest.sha256 (per-file sha256 of
 # every patched package file at chain head), version.txt (full version
 # string), head.txt (40-hex chain head sha), chain.txt (sha + subject per
@@ -50,7 +50,8 @@ RUN set -eux; \
 RUN set -eux; \
     cd /opt/venv/lib/python3.12/site-packages; \
     for d in 008-spec-invalid-tail-metrics 001-clamp_max_tokens \
-             005-qwen-rope-config-validation; do \
+             005-qwen-rope-config-validation 009-prefill-lane-release-aging \
+             010-sched-second-pass-preempt 011-lane-share-align-quantum; do \
       git apply --exclude='tests/*' "/tmp/kk/${d}/port.diff"; \
     done
 
